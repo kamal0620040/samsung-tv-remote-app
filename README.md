@@ -1,0 +1,89 @@
+# Samsung TV Remote App
+
+A native Android remote for Samsung TVs that talks to the TV directly over
+the home network. No bridge, no PC, no server. Discovery is SSDP; control
+uses the Samsung pairing protocol on `wss://<tv>:8002` (2016 and newer TVs).
+Every protocol payload was verified against a decompiled reference app and
+exercised on a real Samsung TV.
+
+## Screenshots
+
+| Search | Remote | Control |
+| --- | --- | --- |
+| ![Search](screenshots/search.jpg) | ![Remote](screenshots/remote.jpg) | ![Control](screenshots/control.jpg) |
+
+| Touchpad | Mirroring | Settings |
+| --- | --- | --- |
+| ![Touchpad](screenshots/touchpad.jpg) | ![Mirroring](screenshots/mirroring.jpg) | ![Settings](screenshots/settings.jpg) |
+
+## Features
+
+- Five tabs: Remote, Control, Touchpad, Mirroring, Settings
+- D-pad with press-and-hold, volume and channel rockers, number pad, media
+  keys and color buttons
+- Text input from the phone keyboard, plus voice typing
+- The TV's real app list with real icons (YouTube, Netflix and the rest)
+- IR blaster mode with Samsung BN59 codes for TVs off the network
+- Screen mirroring and media casting through a built-in MJPEG server
+- Wake-on-LAN, English and Nepali UI, in-app Help with screenshots
+- Live connection status, and the pairing token is saved so reconnecting
+  after the first approval is instant
+
+## Install
+
+Copy the APK to the phone and open it (allow "install from this source"
+when Android asks). First run: pick your TV from the search list (phone and
+TV on the same Wi-Fi) and accept the allow prompt on the TV. 
+
+Requires a 2016+ Samsung TV (the :8002 protocol) and Android 8+ (minSdk 26).
+
+## Building
+
+**Gradle (the standard way).** Open this folder in Android Studio and run
+the `app` module, or use Gradle from the command line. If `gradlew` is not
+present yet, Android Studio generates it on import, or run
+`gradle wrapper --gradle-version 8.9` once. Toolchain: Android Gradle Plugin
+8.7.3, Kotlin 2.0.21, compileSdk 35. Dependencies are deliberately few:
+Kotlin coroutines and OkHttp.
+
+**build.sh (no Gradle).** The repo also carries a small explicit pipeline:
+
+```bash
+./build.sh   # → dist/TV-Remote.apk
+```
+
+kotlinc → d8 → aapt2 → zipalign → apksigner, one visible command per step.
+It is handy when you want to see exactly what an APK build does, or on a
+machine where a full Gradle setup is overkill: there is no build daemon, no
+generated code, and the whole dependency list is a handful of JARs named at
+the top of the script. It needs JDK 21 and Android SDK 35 (build-tools
+35.0.0); tool locations are overridable through `JAVA_HOME`, `ANDROID_HOME`,
+`M2` and `KEYSTORE`.
+
+Either way the result is signed with the standard Android debug key for
+sideloading. For anything beyond personal use, generate a personal keystore
+and keep signing with it: Android only accepts updates signed by the same
+key.
+
+## Project structure
+
+```
+app/          the application: UI, IR blaster, mirroring service
+tvcore/       the Samsung protocol library (discovery, pairing, keys, apps)
+screenshots/  the screenshots above, from a real phone and a real TV
+build.sh      the no-Gradle build pipeline
+```
+
+The UI is plain framework Views with layouts built in code: no AndroidX, no
+Compose, no XML layouts, no generated R class. `tvcore` has no Android UI
+dependencies and can be reused on its own.
+
+## Honest limits
+
+- Pre-2016 (legacy socket) TVs were analysed but are not implemented.
+- Screen mirroring is MJPEG, so it is smooth enough for showing content,
+  not for gaming.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
