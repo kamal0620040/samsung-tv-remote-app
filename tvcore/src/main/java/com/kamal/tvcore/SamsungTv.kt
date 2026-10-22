@@ -88,6 +88,7 @@ class SamsungTv(
     @Volatile private var ws: WebSocket? = null
     @Volatile private var appsCache: List<TvApp>? = null
     @Volatile private var pendingApps: CompletableDeferred<List<TvApp>>? = null
+    private val appsLock = Any()
     private val pendingIcons = ConcurrentHashMap<String, CompletableDeferred<String?>>()
 
     /** Incremented on every connect/disconnect; callbacks from older sockets are ignored. */
@@ -101,24 +102,25 @@ class SamsungTv(
     /** Fingerprint of the certificate the current TV presented but that does not match the stored pin. */
     val pendingPinFingerprint: String?
         get() = candidatePin
-            ?.takeIf { it.host == ip && certs?.get(it.host) != it.fingerprint }
+            ?.takeIf { it.host == ip && it.gen == generation && certs?.get(it.host) != it.fingerprint }
             ?.fingerprint
 
     /**
-     * Trust the certificate the TV most recently presented (or, if none was
-     * recorded, forget the stored pin so the next connection re-pins).
+     * Trust the certificate the current connection attempt presented.
      * Callers should confirm with the user first and clear the pairing
-     * token, since a new certificate means a new pairing.
+     * token, since a new certificate means a new pairing. Returns false
+     * when there is no current candidate (for example the fingerprint
+     * came from a stale handshake); in that case nothing changes, because
+     * silently dropping the stored pin would leave the next connection
+     * unauthenticated until it happened to succeed.
      */
-    fun trustPendingCertificate() {
-        val host = ip ?: return
-        val candidate = candidatePin?.takeIf { it.host == host }
-        if (candidate != null) {
-            certs?.put(host, candidate.fingerprint)
-        } else {
-            certs?.remove(host)
-        }
+    fun trustPendingCertificate(): Boolean {
+        val host = ip ?: return false
+        val candidate = candidatePin?.takeIf { it.host == host && it.gen == generation }
+            ?: return false
+        certs?.put(host, candidate.fingerprint)
         candidatePin = null
+        return true
     }
 
     private inner class PinningTrustManager(
@@ -134,7 +136,9 @@ class SamsungTv(
                 .digest(chain[0].encoded).joinToString("") { "%02x".format(it) }
             // Record what this connection presented; promotion to a stored
             // pin happens only when the channel connects (handleMessage).
-            candidatePin = CandidatePin(gen, host, fp)
+            // A late handshake from an older attempt must not overwrite
+            // the current attempt's candidate.
+            if (gen == generation) candidatePin = CandidatePin(gen, host, fp)
             val stored = store.get(host)
             if (stored != null && stored != fp) {
                 throw CertificateException("TV certificate changed")
@@ -215,7 +219,10 @@ class SamsungTv(
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     if (gen != generation) return // stale socket
                     if (_state.value != ConnState.ERROR) _state.value = ConnState.DISCONNECTED
-                    failPending(CancellationException("connection closed"))
+                    // Transport failure is not caller cancellation: pending
+                    // requests fail with a normal exception so awaiting UI
+                    // coroutines end with an error state, not a cancel.
+                    failPending(IllegalStateException("connection closed"))
                 }
             })
         } catch (e: Exception) {
@@ -235,8 +242,10 @@ class SamsungTv(
     }
 
     private fun failPending(cause: Throwable) {
-        pendingApps?.completeExceptionally(cause)
-        pendingApps = null
+        synchronized(appsLock) {
+            pendingApps?.completeExceptionally(cause)
+            pendingApps = null
+        }
         val icons = pendingIcons.values.toList()
         pendingIcons.clear()
         icons.forEach { it.completeExceptionally(cause) }
@@ -277,8 +286,10 @@ class SamsungTv(
                     }
                 }
                 appsCache = list
-                pendingApps?.complete(list)
-                pendingApps = null
+                synchronized(appsLock) {
+                    pendingApps?.complete(list)
+                    pendingApps = null
+                }
             }
             "ed.apps.icon" -> {
                 val data = msg.optJSONObject("data")
@@ -303,7 +314,7 @@ class SamsungTv(
         try { ws?.close(1000, null) } catch (e: Exception) { /* already closed */ }
         ws = null
         appsCache = null
-        failPending(CancellationException("disconnected"))
+        failPending(IllegalStateException("disconnected"))
         if (_state.value != ConnState.ERROR) _state.value = ConnState.DISCONNECTED
     }
 
@@ -355,39 +366,49 @@ class SamsungTv(
      */
     suspend fun getApps(timeoutMs: Long = 6_000): List<TvApp> {
         appsCache?.let { return it }
-        val deferred = pendingApps ?: CompletableDeferred<List<TvApp>>().also { created ->
-            pendingApps = created
-            if (!send(
-                    JSONObject()
-                        .put("method", "ms.channel.emit")
-                        .put(
-                            "params", JSONObject()
-                                .put("data", "")
-                                .put("event", "ed.installedApp.get")
-                                .put("to", "host")
-                        )
-                )
-            ) {
-                pendingApps = null
-                return emptyList()
+        // Install-or-reuse must be atomic: two concurrent callers must
+        // never create two requests (the second deferred would starve).
+        var created: CompletableDeferred<List<TvApp>>? = null
+        val deferred = synchronized(appsLock) {
+            pendingApps ?: CompletableDeferred<List<TvApp>>().also {
+                pendingApps = it
+                created = it
             }
+        }
+        if (created != null && !send(
+                JSONObject()
+                    .put("method", "ms.channel.emit")
+                    .put(
+                        "params", JSONObject()
+                            .put("data", "")
+                            .put("event", "ed.installedApp.get")
+                            .put("to", "host")
+                    )
+            )
+        ) {
+            synchronized(appsLock) { if (pendingApps === deferred) pendingApps = null }
+            return emptyList()
         }
         return try {
             val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
             if (result == null) {
-                if (pendingApps === deferred) {
-                    pendingApps = null
-                    deferred.cancel()
+                // Timed out: fail the shared request (other awaiters see a
+                // transport failure, not a cancellation) and clear it, so
+                // the next call sends a fresh request.
+                synchronized(appsLock) {
+                    if (pendingApps === deferred) {
+                        pendingApps = null
+                        deferred.completeExceptionally(IllegalStateException("app list request timed out"))
+                    }
                 }
                 emptyList()
             } else {
                 result
             }
         } catch (e: CancellationException) {
-            if (pendingApps === deferred) {
-                pendingApps = null
-                deferred.cancel()
-            }
+            // The caller itself was cancelled: drop the registration so the
+            // next call starts fresh, but leave the deferred for others.
+            synchronized(appsLock) { if (pendingApps === deferred) pendingApps = null }
             throw e
         } catch (e: Exception) {
             emptyList()

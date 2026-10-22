@@ -20,9 +20,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -95,8 +93,11 @@ object MirrorState {
         return fallback
     }
 
-    fun pageUrl(): String = "http://${localIp() ?: "0.0.0.0"}:$PORT/?t=${token()}"
-    fun watchUrl(): String = "http://${localIp() ?: "0.0.0.0"}:$PORT/watch?t=${token()}"
+    /** The address the running server is actually bound to; every URL and probe must use exactly this. */
+    @Volatile var boundIp: String? = null
+
+    fun pageUrl(): String = "http://${boundIp ?: localIp() ?: "0.0.0.0"}:$PORT/?t=${token()}"
+    fun watchUrl(): String = "http://${boundIp ?: localIp() ?: "0.0.0.0"}:$PORT/watch?t=${token()}"
 }
 
 /**
@@ -140,14 +141,7 @@ class MirrorService : Service() {
                 MirrorState.mode = "media"
                 MirrorState.mediaUri = intent.getStringExtra(EXTRA_URI)
                 MirrorState.mediaKind = intent.getStringExtra(EXTRA_KIND) ?: "video"
-                if (Build.VERSION.SDK_INT >= 29) {
-                    startForeground(
-                        NOTIF_ID, buildNotification(Strings.t("notif_media")),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                    )
-                } else {
-                    startForeground(NOTIF_ID, buildNotification(Strings.t("notif_media")))
-                }
+                if (!enterForeground(Strings.t("notif_media"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)) return START_NOT_STICKY
                 if (!startServer()) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -158,15 +152,7 @@ class MirrorService : Service() {
                 closeClients()
                 MirrorState.mode = "mirror"
                 MirrorState.quality = intent.getIntExtra(EXTRA_QUALITY, 1)
-                if (Build.VERSION.SDK_INT >= 29) {
-                    startForeground(
-                        NOTIF_ID, buildNotification(Strings.t("notif_mirror")),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    startForeground(NOTIF_ID, buildNotification(Strings.t("notif_mirror")))
-                }
+                if (!enterForeground(Strings.t("notif_mirror"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)) return START_NOT_STICKY
                 if (!startServer()) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -189,6 +175,28 @@ class MirrorService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Enter the foreground, reporting failure as a mirror error instead of
+     * crashing the service when the platform refuses (missing permission,
+     * background-start restrictions). Returns false when startup must abort.
+     */
+    private fun enterForeground(text: String, type: Int): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIF_ID, buildNotification(text), type)
+            } else {
+                @Suppress("DEPRECATION")
+                startForeground(NOTIF_ID, buildNotification(text))
+            }
+            true
+        } catch (e: Exception) {
+            MirrorState.error = "capture_failed"
+            stopEverything()
+            stopSelf()
+            false
+        }
+    }
+
     private fun buildNotification(text: String): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
@@ -207,7 +215,7 @@ class MirrorService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return Notification.Builder(this, CHANNEL)
-            .setContentTitle("TV Remote")
+            .setContentTitle(Strings.t("app_name"))
             .setContentText(text)
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setContentIntent(open)
@@ -249,6 +257,12 @@ class MirrorService : Service() {
         val imgReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         reader = imgReader
         imgReader.setOnImageAvailableListener({ r ->
+            if (session != captureSession) {
+                // A frame queued by a previous capture: drain and drop it,
+                // so it cannot overwrite the new session's stream.
+                try { r.acquireLatestImage()?.close() } catch (e: Exception) { /* ignore */ }
+                return@setOnImageAvailableListener
+            }
             val now = System.currentTimeMillis()
             if (now - lastFrameAt < minInterval) {
                 // still need to drain the image
@@ -315,12 +329,27 @@ class MirrorService : Service() {
             return false
         }
         server = ss
+        // Advertise exactly the address we bound, everywhere.
+        val boundHost = ss.inetAddress?.hostAddress
+        MirrorState.boundIp = if (boundHost == "0.0.0.0") null else boundHost
         serving = true
         MirrorState.running = true
         MirrorState.error = null
         serverThread = thread(name = "mirror-http") {
             while (serving) {
-                val sock = try { ss.accept() } catch (e: Exception) { break }
+                val sock = try {
+                    ss.accept()
+                } catch (e: Exception) {
+                    // A close from stopEverything (serving already false)
+                    // is the normal stop; anything else is a real failure
+                    // and must not leave the UI claiming "running".
+                    if (serving) {
+                        serving = false
+                        MirrorState.running = false
+                        MirrorState.error = "accept_failed"
+                    }
+                    break
+                }
                 if (clientSockets.size >= MAX_CLIENTS) {
                     try { sock.close() } catch (e: Exception) { }
                     continue
@@ -334,16 +363,34 @@ class MirrorService : Service() {
         return true
     }
 
+    /** Read one line (LF or CRLF terminated), at most [max] bytes; null on EOF or overflow. */
+    private fun readBoundedLine(input: java.io.InputStream, max: Int = 8192): String? {
+        val buf = java.io.ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (buf.size() == 0) null else buf.toString("ISO-8859-1")
+            if (b == '\n'.code) return buf.toString("ISO-8859-1").trimEnd('\r')
+            if (buf.size() >= max) return null
+            buf.write(b)
+        }
+    }
+
     private fun handle(sock: Socket) {
         try {
             sock.soTimeout = 30_000
-            val reader = BufferedReader(InputStreamReader(sock.getInputStream()))
-            val requestLine = reader.readLine() ?: run { sock.close(); return }
+            val input = sock.getInputStream()
+            val requestLine = readBoundedLine(input) ?: run { sock.close(); return }
             val headers = mutableMapOf<String, String>()
-            var line: String?
-            while (reader.readLine().also { line = it } != null && line!!.isNotEmpty()) {
-                val idx = line!!.indexOf(':')
-                if (idx > 0) headers[line!!.substring(0, idx).trim().lowercase()] = line!!.substring(idx + 1).trim()
+            var headerCount = 0
+            while (true) {
+                val line = readBoundedLine(input) ?: run { sock.close(); return }
+                if (line.isEmpty()) break
+                if (++headerCount > 64) {
+                    sock.close()
+                    return
+                }
+                val idx = line.indexOf(':')
+                if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] = line.substring(idx + 1).trim()
             }
             val target = requestLine.split(" ").getOrNull(1) ?: "/"
             val path = target.substringBefore('?')
@@ -442,7 +489,9 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         var start = 0L
         var end = if (total > 0) total - 1 else -1L
         var partial = false
-        if (rangeHeader != null && total > 0) {
+        // Only a syntactically valid Range is honored; anything else is
+        // ignored (full 200), never answered as a full-body 206.
+        if (rangeHeader != null && total > 0 && HttpRange.isRangeHeader(rangeHeader)) {
             val r = HttpRange.parse(rangeHeader, total)
             if (r == null) {
                 afd?.close()
@@ -457,44 +506,68 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
             end = r[1]
             partial = true
         }
-        val len = if (total > 0) (end - start + 1) else -1L
-        val sb = StringBuilder()
-        sb.append(if (partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
-        sb.append("Content-Type: $mime\r\n")
-        sb.append("Accept-Ranges: bytes\r\n")
-        if (total > 0) {
-            sb.append("Content-Length: $len\r\n")
-            if (partial) sb.append("Content-Range: bytes $start-$end/$total\r\n")
-        }
-        sb.append("Connection: close\r\n\r\n")
-        out.write(sb.toString().toByteArray())
+        // Open and position the stream BEFORE writing any success header:
+        // a stream that cannot open, or cannot reach the requested offset,
+        // gets an error response, never a truncated or offset-wrong body.
         try {
-            contentResolver.openInputStream(uri)?.use { input ->
-            if (start > 0) {
-                var toSkip = start
-                while (toSkip > 0) {
-                    val skipped = input.skip(toSkip)
-                    if (skipped <= 0) break
-                    toSkip -= skipped
-                }
+            val input = try { contentResolver.openInputStream(uri) } catch (e: Exception) { null }
+            if (input == null) {
+                writeStatus(out, 500, "Cannot read media")
+                out.flush()
+                return
             }
-            val buf = ByteArray(64 * 1024)
-            var remaining = len
-            while (true) {
-                val want = if (remaining in 1 until buf.size.toLong()) remaining.toInt() else buf.size
-                val n = input.read(buf, 0, want)
-                if (n <= 0) break
-                out.write(buf, 0, n)
-                if (remaining > 0) {
-                    remaining -= n
-                    if (remaining <= 0) break
+            input.use { stream ->
+                if (start > 0 && !skipFully(stream, start)) {
+                    out.write(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .toByteArray()
+                    )
+                    out.flush()
+                    return
                 }
-            }
-            out.flush()
+                val len = if (total > 0) (end - start + 1) else -1L
+                val sb = StringBuilder()
+                sb.append(if (partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+                sb.append("Content-Type: $mime\r\n")
+                sb.append("Accept-Ranges: bytes\r\n")
+                if (total > 0) {
+                    sb.append("Content-Length: $len\r\n")
+                    if (partial) sb.append("Content-Range: bytes $start-$end/$total\r\n")
+                }
+                sb.append("Connection: close\r\n\r\n")
+                out.write(sb.toString().toByteArray())
+                val buf = ByteArray(64 * 1024)
+                var remaining = len
+                while (true) {
+                    val want = if (remaining in 1 until buf.size.toLong()) remaining.toInt() else buf.size
+                    val n = stream.read(buf, 0, want)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    if (remaining > 0) {
+                        remaining -= n
+                        if (remaining <= 0) break
+                    }
+                }
+                out.flush()
             }
         } finally {
             afd?.close()
         }
+    }
+
+    /** Skip exactly [bytes] or report failure; a short skip must not silently corrupt the stream. */
+    private fun skipFully(input: java.io.InputStream, bytes: Long): Boolean {
+        var remaining = bytes
+        while (remaining > 0) {
+            val skipped = try { input.skip(remaining) } catch (e: Exception) { return false }
+            if (skipped > 0) {
+                remaining -= skipped
+            } else {
+                if (input.read() == -1) return false
+                remaining--
+            }
+        }
+        return true
     }
 
     // ---------------- lifecycle ----------------
@@ -506,6 +579,7 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         // that starts after this call (mode switch, restart).
         captureSession++
         MirrorState.latestJpeg = null
+        lastFrameAt = 0L
         try { virtualDisplay?.release() } catch (e: Exception) { }
         virtualDisplay = null
         try { reader?.close() } catch (e: Exception) { }
@@ -529,6 +603,7 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         serving = false
         MirrorState.running = false
         MirrorState.sessionToken = ""
+        MirrorState.boundIp = null
         closeClients()
         stopCapture()
         try { server?.close() } catch (e: Exception) { }

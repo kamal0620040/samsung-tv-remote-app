@@ -1,7 +1,9 @@
 package com.kamal.tvcore
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class HttpRangeTest {
@@ -43,6 +45,16 @@ class HttpRangeTest {
         assertArrayEquals(longArrayOf(0, 999), parse("garbage"))
         assertArrayEquals(longArrayOf(0, 999), parse("bytes=10-20 trailing"))
         assertArrayEquals(longArrayOf(0, 999), parse("xbytes=10-20"))
+    }
+
+    @Test
+    fun `range header recognition separates valid ranges from garbage`() {
+        assertTrue(HttpRange.isRangeHeader("bytes=0-"))
+        assertTrue(HttpRange.isRangeHeader("bytes=100-199"))
+        assertTrue(HttpRange.isRangeHeader("bytes=-500"))
+        assertFalse(HttpRange.isRangeHeader("garbage"))
+        assertFalse(HttpRange.isRangeHeader("bytes=10-20 trailing"))
+        assertFalse(HttpRange.isRangeHeader("xbytes=10-20"))
     }
 
     @Test

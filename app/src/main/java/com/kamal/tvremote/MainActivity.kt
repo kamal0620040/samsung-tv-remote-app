@@ -39,6 +39,7 @@ import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withPermit
 import kotlin.concurrent.thread
 
 // Design tokens (v1.6 minimal redesign). Names kept from v1.5 for call sites.
@@ -117,12 +118,13 @@ class MainActivity : Activity() {
     private var scanGen = 0
     private var bannerRetry: TextView? = null
     private val iconCache = java.util.Collections.synchronizedMap(HashMap<String, android.graphics.Bitmap>())
+    private val iconGate = kotlinx.coroutines.sync.Semaphore(4)
     private val irHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var irRepeatKey: String? = null
     private val irRepeater = object : Runnable {
         override fun run() {
             val key = irRepeatKey ?: return
-            irExecutor.execute { ir.send(key) }
+            irSend(key)
             irHandler.postDelayed(this, 130)
         }
     }
@@ -148,6 +150,7 @@ class MainActivity : Activity() {
             screen = savedInstanceState.getString("screen", "main") ?: "main"
             returnTab = savedInstanceState.getString("returnTab", "touchpad") ?: "touchpad"
             mirrorQuality = savedInstanceState.getInt("mirrorQuality", 1)
+            pendingMediaKind = savedInstanceState.getString("pendingMediaKind", "video") ?: "video"
         }
         if (android.os.Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
@@ -188,6 +191,7 @@ class MainActivity : Activity() {
         outState.putString("screen", screen)
         outState.putString("returnTab", returnTab)
         outState.putInt("mirrorQuality", mirrorQuality)
+        outState.putString("pendingMediaKind", pendingMediaKind)
     }
 
     override fun onDestroy() {
@@ -225,6 +229,13 @@ class MainActivity : Activity() {
     /** Single background thread for IR sends, so a held key never spawns a thread per repeat. */
     private val irExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
+    /** IR send that tolerates the executor being shut down during teardown. */
+    private fun irSend(key: String) {
+        try {
+            irExecutor.execute { ir.send(key) }
+        } catch (e: Exception) { /* the activity is going away */ }
+    }
+
     /** Connect, dropping cached icons when switching to a different TV. */
     private fun connectTo(ip: String) {
         if (ip != tv.ip) iconCache.clear()
@@ -233,7 +244,7 @@ class MainActivity : Activity() {
 
     private fun pressKey(key: String) {
         if (mode == "ir") {
-            irExecutor.execute { ir.send(key) }
+            irSend(key)
         } else {
             tv.click(key)
         }
@@ -246,7 +257,7 @@ class MainActivity : Activity() {
                     v.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
                     v.isPressed = true
                     if (mode == "ir") {
-                        irExecutor.execute { ir.send(key) }
+                        irSend(key)
                         // IR has no press/release pair: repeat while held.
                         irRepeatKey = key
                         irHandler.removeCallbacks(irRepeater)
@@ -301,6 +312,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_HORIZONTAL
         }
         val btn = iconBtn(name, tint, 56f, 24f)
+        btn.contentDescription = caption
         col.addView(btn)
         col.addView(label(caption, 12f, DIM, gravity = Gravity.CENTER).apply {
             layoutParams = LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4f) }
@@ -485,9 +497,12 @@ class MainActivity : Activity() {
             .setTitle(Strings.t("trust_new"))
             .setMessage(message)
             .setPositiveButton(Strings.t("trust_new")) { _, _ ->
-                tv.trustPendingCertificate()
-                prefs.tokens.remove(ip)
-                tv.connect(ip)
+                if (tv.trustPendingCertificate()) {
+                    prefs.tokens.remove(ip)
+                    tv.connect(ip)
+                } else {
+                    toast(Strings.t("err_failed"))
+                }
             }
             .setNegativeButton(Strings.t("cancel"), null)
             .show()
@@ -752,20 +767,20 @@ class MainActivity : Activity() {
         // Media row: four equal circles.
         val media = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         listOf(
-            "ic_rewind" to "KEY_REWIND",
-            "ic_play" to "KEY_PLAY",
-            "ic_pause" to "KEY_PAUSE",
-            "ic_forward" to "KEY_FF",
-        ).forEach { (ic, key) ->
+            Triple("ic_rewind", "KEY_REWIND", "m_rewind"),
+            Triple("ic_play", "KEY_PLAY", "m_play"),
+            Triple("ic_pause", "KEY_PAUSE", "m_pause"),
+            Triple("ic_forward", "KEY_FF", "m_forward"),
+        ).forEach { (ic, key, descKey) ->
             val holder = LinearLayout(this).apply { gravity = Gravity.CENTER }
-            val btn = iconBtn(ic, ON_BG, 56f, 24f)
+            val btn = iconBtn(ic, ON_BG, 56f, 24f, desc = Strings.t(descKey))
             btn.tap { pressKey(key) }
             holder.addView(btn)
             media.addView(holder, LinearLayout.LayoutParams(0, -2, 1f))
         }
         root.addView(media, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16f) })
 
-        // Color keys: 40dp, slightly desaturated.
+        // Color keys, slightly desaturated.
         val colors = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val colorDefs = listOf(
             Triple("A", Color.rgb(198, 84, 84), "KEY_RED"),
@@ -778,7 +793,7 @@ class MainActivity : Activity() {
                 background = rippleKey(color, 16f)
             }
             b.tap { pressKey(key) }
-            colors.addView(b, LinearLayout.LayoutParams(0, dp(40f), 1f).apply {
+            colors.addView(b, LinearLayout.LayoutParams(0, dp(48f), 1f).apply {
                 if (i > 0) leftMargin = dp(8f)
             })
         }
@@ -796,24 +811,26 @@ class MainActivity : Activity() {
         }
         // Top actions: three equal pills.
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun pill(iconName: String, action: () -> Unit): LinearLayout {
+        fun pill(iconName: String, descKey: String, action: () -> Unit): LinearLayout {
             val p = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
                 background = rippleKey(PANEL, 24f)
+                contentDescription = Strings.t(descKey)
             }
             p.addView(icon(iconName, 24f, ON_BG))
             p.tap { action() }
             return p
         }
-        top.addView(pill("ic_keyboard") { returnTab = "touchpad"; showInput() }, LinearLayout.LayoutParams(0, dp(48f), 1f))
-        top.addView(pill("ic_mic") { startVoice() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
-        top.addView(pill("ic_apps") { returnTab = "touchpad"; showApps() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
+        top.addView(pill("ic_keyboard", "tp_keyboard") { returnTab = "touchpad"; showInput() }, LinearLayout.LayoutParams(0, dp(48f), 1f))
+        top.addView(pill("ic_mic", "tp_voice") { startVoice() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
+        top.addView(pill("ic_apps", "apps") { returnTab = "touchpad"; showApps() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
         root.addView(top, LinearLayout.LayoutParams(-1, -2))
 
         // Swipe surface fills the remaining height.
         val pad = FrameLayout(this).apply {
             background = rounded(PANEL, 24f, this@MainActivity)
+            contentDescription = Strings.t("swipe_hint")
         }
         val centerCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1013,6 +1030,7 @@ class MainActivity : Activity() {
         val backIv = icon("ic_back", 24f, ON_BG)
         backIv.layoutParams = FrameLayout.LayoutParams(dp(24f), dp(24f), Gravity.CENTER)
         backBtn.addView(backIv)
+        backBtn.contentDescription = Strings.t("back")
         backBtn.layoutParams = LinearLayout.LayoutParams(dp(48f), dp(48f))
         backBtn.tap { showMain("mirroring") }
         bar.addView(backBtn)
@@ -1129,11 +1147,19 @@ class MainActivity : Activity() {
 
     private var pendingMediaKind = "video"
 
-    /** Poll the mirror server until it answers (or ~4s pass) instead of guessing with a fixed delay. */
-    private suspend fun waitForMirrorServer() {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val url = java.net.URL("http://${MirrorState.localIp() ?: "127.0.0.1"}:${MirrorState.PORT}/?t=${MirrorState.token()}")
+    /**
+     * Poll the mirror server until it answers (or ~4s pass) instead of
+     * guessing with a fixed delay. Returns false when the service reported
+     * a failure or the server never came up, so callers show the error
+     * instead of opening a dead URL on the TV.
+     */
+    private suspend fun waitForMirrorServer(): Boolean {
+        if (MirrorState.error != null) return false
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val host = MirrorState.boundIp ?: MirrorState.localIp() ?: "127.0.0.1"
+            val url = java.net.URL("http://$host:${MirrorState.PORT}/?t=${MirrorState.token()}")
             repeat(20) {
+                if (MirrorState.error != null) return@withContext false
                 var conn: java.net.HttpURLConnection? = null
                 try {
                     conn = url.openConnection() as java.net.HttpURLConnection
@@ -1143,14 +1169,19 @@ class MainActivity : Activity() {
                     // redirect itself already proves the server is up.
                     conn.instanceFollowRedirects = false
                     val code = conn.responseCode
-                    if (code == 200 || code == 302) return@withContext
+                    if (code == 200 || code == 302) return@withContext true
                 } catch (e: Exception) { /* server not up yet */ } finally {
                     conn?.disconnect()
                 }
                 delay(200)
             }
+            MirrorState.running
         }
     }
+
+    /** The mirror failure as a user message (port busy has its own string). */
+    private fun mirrorErrorText(): String =
+        if (MirrorState.error == "port_busy") Strings.t("mirror_port_busy") else Strings.t("err_failed")
 
     /** Launch the TV browser and type the URL (same trick as the reference). */
     private fun openOnTv(url: String) {
@@ -1197,7 +1228,7 @@ class MainActivity : Activity() {
         root.applySystemInsets()
 
         if (!tv.connected) {
-            status.text = Strings.t("apps_empty")
+            status.text = Strings.t("err_failed")
             return
         }
         scope.launch {
@@ -1251,7 +1282,9 @@ class MainActivity : Activity() {
                 letter.visibility = View.INVISIBLE
             } else {
                 scope.launch {
-                    val b64 = tv.getAppIcon(app.iconPath) ?: return@launch
+                    // Cap concurrent icon fetches: a large app list must not
+                    // flood the TV with requests all at once.
+                    val b64 = iconGate.withPermit { tv.getAppIcon(app.iconPath) } ?: return@launch
                     // Decode off the main thread; icons are cached for the session.
                     val bmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                         try {
@@ -1301,9 +1334,12 @@ class MainActivity : Activity() {
             val text = field.text.toString()
             if (text.isBlank()) return
             if (mode == "wifi") {
-                tv.sendText(text)
-                toast(Strings.t("sent"))
-                field.text.clear()
+                if (tv.sendText(text)) {
+                    toast(Strings.t("sent"))
+                    field.text.clear()
+                } else {
+                    toast(Strings.t("err_failed"))
+                }
             } else {
                 toast(Strings.t("ir_none"))
             }
@@ -1325,6 +1361,7 @@ class MainActivity : Activity() {
         val sendIv = icon("ic_send", 24f, Color.WHITE)
         sendIv.layoutParams = FrameLayout.LayoutParams(dp(24f), dp(24f), Gravity.CENTER)
         send.addView(sendIv)
+        send.contentDescription = Strings.t("send")
         send.layoutParams = LinearLayout.LayoutParams(dp(48f), dp(48f))
         send.tap { doSend() }
         bar.addView(send)
@@ -1480,6 +1517,29 @@ class MainActivity : Activity() {
                 showSearch()
             }
             root.addView(disc, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24f) })
+            val forget = label(Strings.t("forget_tv"), 16f, DANGER, gravity = Gravity.CENTER).apply {
+                setPadding(dp(16f), dp(8f), dp(16f), dp(16f))
+            }
+            forget.tap {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle(Strings.t("forget_tv"))
+                    .setMessage(Strings.t("forget_tv_msg"))
+                    .setPositiveButton(Strings.t("forget_tv")) { _, _ ->
+                        prefs.savedIp?.let { ip ->
+                            prefs.tokens.remove(ip)
+                            prefs.certs.remove(ip)
+                        }
+                        tv.disconnect()
+                        prefs.savedIp = null
+                        prefs.savedName = null
+                        prefs.savedModel = null
+                        prefs.savedMac = null
+                        showSearch()
+                    }
+                    .setNegativeButton(Strings.t("cancel"), null)
+                    .show()
+            }
+            root.addView(forget, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8f) })
         }
         return root
     }
@@ -1768,6 +1828,7 @@ class MainActivity : Activity() {
         arrow.rotation = 180f
         card.addView(arrow, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) })
         card.tap {
+            if (dev.ip != prefs.savedIp) prefs.savedMac = null // the old TV's MAC must not wake the new one
             prefs.savedIp = dev.ip
             prefs.savedName = dev.name
             prefs.savedModel = dev.model
@@ -1813,6 +1874,7 @@ class MainActivity : Activity() {
             .setPositiveButton(Strings.t("connect")) { _, _ ->
                 val ip = field.text.toString().trim()
                 if (isValidHostAddress(ip)) {
+                    if (ip != prefs.savedIp) prefs.savedMac = null // the old TV's MAC must not wake the new one
                     prefs.savedIp = ip
                     prefs.savedName = null
                     prefs.savedModel = null
@@ -1838,11 +1900,16 @@ class MainActivity : Activity() {
                         putExtra(MirrorService.EXTRA_DATA, data)
                         putExtra(MirrorService.EXTRA_QUALITY, mirrorQuality)
                     }
+                    MirrorState.error = null // a stale error from a previous attempt must not fail this one
                     startForegroundService(intent)
                     scope.launch {
-                        waitForMirrorServer()
-                        openOnTv(MirrorState.pageUrl())
-                        if (screen == "mirror") showMirror()
+                        if (waitForMirrorServer()) {
+                            openOnTv(MirrorState.pageUrl())
+                            if (screen == "mirror") showMirror()
+                        } else {
+                            toast(mirrorErrorText())
+                            showMirror() // the screen that shows the error
+                        }
                     }
                 }
             }
@@ -1859,12 +1926,17 @@ class MainActivity : Activity() {
                         putExtra(MirrorService.EXTRA_URI, uri.toString())
                         putExtra(MirrorService.EXTRA_KIND, pendingMediaKind)
                     }
+                    MirrorState.error = null // a stale error from a previous attempt must not fail this one
                     startForegroundService(intent)
                     scope.launch {
-                        waitForMirrorServer()
-                        openOnTv(MirrorState.watchUrl())
+                        if (waitForMirrorServer()) {
+                            openOnTv(MirrorState.watchUrl())
+                            toast(Strings.t("media_opening") + " " + MirrorState.watchUrl())
+                        } else {
+                            toast(mirrorErrorText())
+                            showMain("mirroring")
+                        }
                     }
-                    toast(Strings.t("media_opening") + " " + MirrorState.watchUrl())
                 }
             }
             REQ_VOICE -> {
@@ -1872,8 +1944,7 @@ class MainActivity : Activity() {
                     val spoken = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                         ?.firstOrNull().orEmpty()
                     if (spoken.isNotBlank() && mode == "wifi") {
-                        tv.sendText(spoken)
-                        toast(Strings.t("sent"))
+                        toast(if (tv.sendText(spoken)) Strings.t("sent") else Strings.t("err_failed"))
                     }
                 }
             }

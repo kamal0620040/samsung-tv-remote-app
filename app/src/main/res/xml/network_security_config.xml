@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  This app only ever talks to devices on the user's own local network:
+  TVs serve their UPnP descriptions over plain HTTP, the TV's browser
+  opens the mirror stream over plain HTTP, and the app probes that same
+  local server while a cast starts. There is no backend and no internet
+  endpoint. Android's default policy (cleartext off for apps targeting
+  API 28+) would break those LAN flows, so cleartext is permitted; the
+  trade-off is documented in the README. The TV control channel itself
+  is wss with certificate pinning and is unaffected.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

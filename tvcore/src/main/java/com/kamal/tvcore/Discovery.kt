@@ -2,6 +2,7 @@ package com.kamal.tvcore
 
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -20,7 +21,6 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
 
 data class TvDevice(val ip: String, val name: String?, val model: String?, val location: String?)
 
@@ -32,10 +32,15 @@ data class TvDevice(val ip: String, val name: String?, val model: String?, val l
  * Samsung in SERVER/USN, confirmed again by the description's manufacturer)
  * are returned, so routers and printers on the LAN stay out of the TV list.
  * The caller must hold a WifiManager.MulticastLock while this runs.
+ *
+ * Enrichment runs under one deadline in its own coroutine scope, so the
+ * limit really cancels outstanding fetches, and every fetch is isolated:
+ * one malformed or hostile response can never abort the whole scan.
  */
 object SsdpDiscovery {
 
     private const val SAMSUNG_ST = "urn:samsung.com:device:RemoteControlReceiver:1"
+    private const val MAX_DESCRIPTION_BYTES = 256L * 1024
 
     private val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -84,9 +89,15 @@ object SsdpDiscovery {
                 val samsungish = st == SAMSUNG_ST.lowercase() ||
                     server.contains("samsung") || st.contains("samsung") || usn.contains("samsung")
                 val ip = packet.address.hostAddress ?: continue
-                if (samsungish && headers["location"] != null && !found.containsKey(ip)) {
+                if (samsungish && headers["location"] != null) {
                     val strong = st == SAMSUNG_ST.lowercase() || usn.contains("samsung")
-                    found[ip] = Candidate(TvDevice(ip, null, null, headers["location"]), strong)
+                    val existing = found[ip]
+                    if (existing == null) {
+                        found[ip] = Candidate(TvDevice(ip, null, null, headers["location"]), strong)
+                    } else if (strong && !existing.strong) {
+                        // A later response can prove more than the first one did.
+                        found[ip] = Candidate(existing.device.copy(location = headers["location"]), true)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -97,33 +108,26 @@ object SsdpDiscovery {
         if (found.isEmpty()) return@withContext emptyList()
 
         // Enrich in parallel under one overall deadline. The fetches are
-        // cancellable OkHttp calls, so the deadline really bounds the wait
-        // (a blocking execute() would ignore cancellation and overrun it).
+        // created inside the timeout's own scope, so the deadline cancels
+        // them for real (fetches created outside would outlive the wait).
         val candidates = found.values.toList()
-        val deferreds: List<Deferred<TvDevice?>> = candidates.map { candidate ->
-            async { enrich(candidate) }
+        var deferreds: List<Deferred<TvDevice?>> = emptyList()
+        val completed = withTimeoutOrNull(3_000) {
+            val defs = candidates.map { candidate -> async { enrich(candidate) } }
+            deferreds = defs
+            defs.awaitAll()
         }
-        val completed = withTimeoutOrNull(3_000) { deferreds.awaitAll() }
         if (completed != null) {
             return@withContext completed.filterNotNull()
         }
-        // Timed out: keep finished results, and keep unfinished candidates
-        // only when their own response already proved they are Samsung.
+        // Timed out: keep finished results, and keep unfinished or failed
+        // candidates only when their own response already proved Samsung.
         val out = ArrayList<TvDevice>()
         deferreds.forEachIndexed { i, deferred ->
             val candidate = candidates[i]
-            val enriched: TvDevice? = if (deferred.isCompleted) {
-                try {
-                    deferred.await()
-                } catch (e: Exception) {
-                    null
-                }
-            } else {
-                null
-            }
+            val hasValue = deferred.isCompleted && deferred.getCompletionExceptionOrNull() == null
             when {
-                enriched != null -> out.add(enriched)
-                deferred.isCompleted -> Unit // finished as non-Samsung, or failed without proving anything
+                hasValue -> try { deferred.await() } catch (e: Exception) { null }?.let { out.add(it) }
                 candidate.strong -> out.add(candidate.device)
             }
         }
@@ -133,7 +137,9 @@ object SsdpDiscovery {
     /**
      * Returns the enriched device, or null when its description proves it is
      * not a Samsung. A device whose description cannot be fetched keeps its
-     * admission signal and is returned unchanged.
+     * admission signal and is returned unchanged. A fetched description
+     * with no manufacturer proves nothing, so only a strong candidate
+     * survives it.
      */
     private suspend fun enrich(candidate: Candidate): TvDevice? {
         val dev = candidate.device
@@ -141,34 +147,57 @@ object SsdpDiscovery {
         val xml = fetchDescription(loc) ?: return dev
         val (name, model, maker) = parseDescription(xml)
         if (maker != null && !maker.lowercase().contains("samsung")) return null
+        if (maker == null && !candidate.strong) return null
         return dev.copy(
             name = name ?: dev.name,
             model = model ?: dev.model,
         )
     }
 
-    /** Cancellable description fetch: cancelling the coroutine cancels the HTTP call. */
-    private suspend fun fetchDescription(location: String): String? =
-        suspendCancellableCoroutine { cont ->
-            val call = http.newCall(Request.Builder().url(location).build())
+    /**
+     * Cancellable description fetch. Never throws and never resumes twice:
+     * any failure, including a malformed LOCATION from an untrusted SSDP
+     * response, yields null so one bad device cannot fail the whole scan.
+     * The body is capped because the responder is untrusted.
+     */
+    @OptIn(InternalCoroutinesApi::class) // tryResume resumes only when not already cancelled or resumed
+    private suspend fun fetchDescription(location: String): String? {
+        val request = try {
+            Request.Builder().url(location).build()
+        } catch (e: Exception) {
+            return null
+        }
+        return suspendCancellableCoroutine { cont ->
+            val call = try {
+                http.newCall(request)
+            } catch (e: Exception) {
+                cont.tryResume(null)
+                return@suspendCancellableCoroutine
+            }
             cont.invokeOnCancellation {
                 try { call.cancel() } catch (e: Exception) { /* already done */ }
             }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    if (cont.isActive) cont.resume(null)
+                    cont.tryResume(null)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
                     val body = try {
-                        response.use { it.body?.string() }
+                        response.use {
+                            val source = it.body?.source() ?: return@use null
+                            val buffer = okio.Buffer()
+                            source.read(buffer, MAX_DESCRIPTION_BYTES)
+                            buffer.readUtf8()
+                        }
                     } catch (e: Exception) {
                         null
                     }
-                    if (cont.isActive) cont.resume(body)
+                    cont.tryResume(body)
                 }
             })
         }
+    }
 
     /** Extracts (friendlyName, modelName, manufacturer) with a real XML parser. */
     private fun parseDescription(xml: String): Triple<String?, String?, String?> {

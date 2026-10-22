@@ -49,7 +49,7 @@ compileSdk 35. Dependencies are deliberately few: Kotlin coroutines and
 OkHttp.
 
 **Tests.** JUnit 5 unit tests live in `tvcore/src/test` and `app/src/test`
-(Range parsing, MAC validation, English/Nepali string parity):
+(Range parsing, MAC validation, TV address validation, English/Nepali string parity):
 `gradle test`. A ready-to-enable GitHub Actions workflow is kept in
 `ci/github-actions.yml` (see the note at the top of that file).
 
@@ -92,6 +92,10 @@ so it is reusable in other Android apps rather than as a pure JVM library.
 
 - Network permissions (internet, Wi-Fi state, multicast) are used only to
   find and talk to your TV on your own network. Nothing leaves the LAN.
+- TVs and their browsers speak plain HTTP on the LAN (UPnP descriptions,
+  the mirror stream), so the app permits cleartext HTTP through its
+  network security config. The control connection to the TV itself is
+  encrypted (wss) and pinned to the TV's certificate.
 - The pairing token and the TV's certificate fingerprint are stored only on
   the phone, and Android backups are disabled for this app. The first
   connection pins the TV's certificate; if the TV's certificate ever
@@ -100,8 +104,10 @@ so it is reusable in other Android apps rather than as a pure JVM library.
 - Screen mirroring runs a small HTTP server on port 8080, bound to the
   phone's Wi-Fi address, so the TV's browser can open the stream. Every
   address it serves includes a random per-session token, and requests
-  without it are refused, so other devices on the same Wi-Fi cannot watch.
-  The server stops with the cast.
+  without it are refused. The token travels inside the address the TV
+  opens, so anyone who can see that address can use it until the cast
+  stops; treat it like a session password. The server stops with the
+  cast.
 - IR mode uses the phone's infrared blaster and needs no network at all.
 
 ## Troubleshooting

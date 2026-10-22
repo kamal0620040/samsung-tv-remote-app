@@ -24,3 +24,9 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
 }
+
+// The tests are JUnit 5 (Jupiter); without this, Gradle's default JUnit 4
+// runner silently discovers zero tests and reports a false green.
+tasks.withType<Test> {
+    useJUnitPlatform()
+}
