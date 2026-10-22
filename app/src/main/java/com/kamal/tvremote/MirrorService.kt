@@ -26,6 +26,8 @@ import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import com.kamal.tvcore.HttpRange
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
@@ -55,6 +57,7 @@ object MirrorState {
      */
     @Volatile var sessionToken: String = ""
 
+    @Synchronized
     fun token(): String {
         if (sessionToken.isEmpty()) {
             val bytes = ByteArray(9)
@@ -65,6 +68,7 @@ object MirrorState {
     }
 
     fun localIp(): String? {
+        var fallback: String? = null
         try {
             val ifaces = NetworkInterface.getNetworkInterfaces()
             while (ifaces.hasMoreElements()) {
@@ -73,11 +77,22 @@ object MirrorState {
                 val addrs = ni.inetAddresses
                 while (addrs.hasMoreElements()) {
                     val a = addrs.nextElement()
-                    if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
+                    if (a is Inet4Address && !a.isLoopbackAddress) {
+                        val host = a.hostAddress ?: continue
+                        val name = ni.name.lowercase()
+                        // Prefer Wi-Fi: VPN (tun/ppp) and cellular (rmnet)
+                        // addresses are not reachable from the TV.
+                        if (name.startsWith("wlan")) return host
+                        if (fallback == null && !name.startsWith("tun") &&
+                            !name.startsWith("ppp") && !name.startsWith("rmnet")
+                        ) {
+                            fallback = host
+                        }
+                    }
                 }
             }
         } catch (e: Exception) { /* no network */ }
-        return null
+        return fallback
     }
 
     fun pageUrl(): String = "http://${localIp() ?: "0.0.0.0"}:$PORT/?t=${token()}"
@@ -104,6 +119,9 @@ class MirrorService : Service() {
     private var bgThread: HandlerThread? = null
     private var lastFrameAt = 0L
 
+    /** Incremented whenever a capture starts or is torn down, so a stopped projection's late callback can tell it is stale. */
+    @Volatile private var captureSession = 0
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -118,14 +136,26 @@ class MirrorService : Service() {
             }
             ACTION_MEDIA -> {
                 stopCapture() // a screen capture must not leak into media mode
+                closeClients() // stream clients from a previous mode must not linger
                 MirrorState.mode = "media"
                 MirrorState.mediaUri = intent.getStringExtra(EXTRA_URI)
                 MirrorState.mediaKind = intent.getStringExtra(EXTRA_KIND) ?: "video"
-                startForeground(NOTIF_ID, buildNotification(Strings.t("notif_media")))
-                startServer()
+                if (Build.VERSION.SDK_INT >= 29) {
+                    startForeground(
+                        NOTIF_ID, buildNotification(Strings.t("notif_media")),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                    )
+                } else {
+                    startForeground(NOTIF_ID, buildNotification(Strings.t("notif_media")))
+                }
+                if (!startServer()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
             ACTION_MIRROR -> {
                 stopCapture() // release any previous capture before starting a new one
+                closeClients()
                 MirrorState.mode = "mirror"
                 MirrorState.quality = intent.getIntExtra(EXTRA_QUALITY, 1)
                 if (Build.VERSION.SDK_INT >= 29) {
@@ -137,7 +167,11 @@ class MirrorService : Service() {
                     @Suppress("DEPRECATION")
                     startForeground(NOTIF_ID, buildNotification(Strings.t("notif_mirror")))
                 }
-                startServer()
+                if (!startServer()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 val code = intent.getIntExtra(EXTRA_CODE, 0)
                 @Suppress("DEPRECATION")
                 val data: Intent? = intent.getParcelableExtra(EXTRA_DATA)
@@ -159,7 +193,7 @@ class MirrorService : Service() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "Mirroring", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(CHANNEL, Strings.t("notif_channel"), NotificationManager.IMPORTANCE_LOW)
             )
         }
         val open = PendingIntent.getActivity(
@@ -188,10 +222,15 @@ class MirrorService : Service() {
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val proj = mpm.getMediaProjection(resultCode, data)
         projection = proj
+        val session = ++captureSession
         bgThread = HandlerThread("mirror-capture").apply { start() }
         val handler = Handler(bgThread!!.looper)
         proj.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
+                // A stop we triggered ourselves (mode switch, teardown)
+                // bumps captureSession first, so this late callback from an
+                // old projection must not kill the session that replaced it.
+                if (session != captureSession) return
                 stopEverything()
                 stopSelf()
             }
@@ -250,40 +289,49 @@ class MirrorService : Service() {
 
     // ---------------- HTTP server ----------------
 
-    private fun startServer() {
-        if (serving) return
-        serving = true
+    /**
+     * Bind the server socket on the calling thread, then run the accept
+     * loop in the background. Returns false when the port cannot be bound,
+     * so the caller can abort instead of starting a capture nobody can
+     * watch (and "running" is only ever claimed for a bound socket).
+     */
+    @Synchronized
+    private fun startServer(): Boolean {
+        if (serving) return true
         MirrorState.token() // make sure a token exists before anyone connects
+        // Bind to the phone's LAN address (the same address the TV is given
+        // in the URL), not to every interface; fall back to all interfaces
+        // when no LAN address is known.
+        val ss = try {
+            val bindAddress = MirrorState.localIp()?.let { InetAddress.getByName(it) }
+            if (bindAddress != null) {
+                ServerSocket(MirrorState.PORT, 50, bindAddress)
+            } else {
+                ServerSocket(MirrorState.PORT)
+            }
+        } catch (e: Exception) {
+            MirrorState.error = "port_busy"
+            MirrorState.running = false
+            return false
+        }
+        server = ss
+        serving = true
+        MirrorState.running = true
+        MirrorState.error = null
         serverThread = thread(name = "mirror-http") {
-            try {
-                val ss = ServerSocket(MirrorState.PORT)
-                server = ss
-                // Only claim "running" once the port is actually bound, so a
-                // collision surfaces as an error instead of a false state.
-                MirrorState.running = true
-                MirrorState.error = null
-                while (serving) {
-                    val sock = ss.accept()
-                    if (clientSockets.size >= MAX_CLIENTS) {
-                        try { sock.close() } catch (e: Exception) { }
-                        continue
-                    }
-                    clientSockets.add(sock)
-                    thread {
-                        try { handle(sock) } finally { clientSockets.remove(sock) }
-                    }
+            while (serving) {
+                val sock = try { ss.accept() } catch (e: Exception) { break }
+                if (clientSockets.size >= MAX_CLIENTS) {
+                    try { sock.close() } catch (e: Exception) { }
+                    continue
                 }
-            } catch (e: Exception) {
-                if (serving) {
-                    // The socket failed while we should be up (usually the
-                    // port is taken by another app).
-                    serving = false
-                    MirrorState.running = false
-                    MirrorState.error = "port_busy"
+                clientSockets.add(sock)
+                thread {
+                    try { handle(sock) } finally { clientSockets.remove(sock) }
                 }
-                // else: socket closed by stopEverything — the normal stop path
             }
         }
+        return true
     }
 
     private fun handle(sock: Socket) {
@@ -366,7 +414,7 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         )
         out.flush()
         var last = -1L
-        while (serving) {
+        while (serving && MirrorState.mode == "mirror") {
             val seq = MirrorState.frameSeq
             val frame = MirrorState.latestJpeg
             if (frame != null && seq != last) {
@@ -378,27 +426,6 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
             } else {
                 Thread.sleep(30)
             }
-        }
-    }
-
-    /**
-     * Resolve an HTTP Range header against the file size. Returns
-     * [start, end] inclusive, or null when the range is invalid (the caller
-     * answers 416). Supports bytes=a-b, bytes=a- and bytes=-n (suffix).
-     */
-    private fun parseRange(header: String, total: Long): LongArray? {
-        val m = Regex("bytes=(\\d*)-(\\d*)").find(header.trim())
-            ?: return longArrayOf(0, total - 1)
-        val a = m.groupValues[1]
-        val b = m.groupValues[2]
-        if (a.isEmpty() && b.isEmpty()) return null
-        return if (a.isEmpty()) {
-            val n = b.toLong()
-            if (n <= 0) null else longArrayOf(maxOf(0L, total - n), total - 1)
-        } else {
-            val s = a.toLong()
-            val e = if (b.isEmpty()) total - 1 else minOf(b.toLong(), total - 1)
-            if (s >= total || s > e) null else longArrayOf(s, e)
         }
     }
 
@@ -416,7 +443,7 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         var end = if (total > 0) total - 1 else -1L
         var partial = false
         if (rangeHeader != null && total > 0) {
-            val r = parseRange(rangeHeader, total)
+            val r = HttpRange.parse(rangeHeader, total)
             if (r == null) {
                 afd?.close()
                 out.write(
@@ -441,7 +468,8 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         }
         sb.append("Connection: close\r\n\r\n")
         out.write(sb.toString().toByteArray())
-        contentResolver.openInputStream(uri)?.use { input ->
+        try {
+            contentResolver.openInputStream(uri)?.use { input ->
             if (start > 0) {
                 var toSkip = start
                 while (toSkip > 0) {
@@ -463,14 +491,20 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
                 }
             }
             out.flush()
+            }
+        } finally {
+            afd?.close()
         }
-        afd?.close()
     }
 
     // ---------------- lifecycle ----------------
 
     /** Release capture resources only; the HTTP server may keep running. */
     private fun stopCapture() {
+        // Invalidate the current projection's callback first: stop() below
+        // fires onStop asynchronously, and it must not tear down a session
+        // that starts after this call (mode switch, restart).
+        captureSession++
         MirrorState.latestJpeg = null
         try { virtualDisplay?.release() } catch (e: Exception) { }
         virtualDisplay = null
@@ -482,17 +516,20 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
         bgThread = null
     }
 
+    /** Force every connected HTTP client out, so stream handlers exit their loops and slots free up. */
+    private fun closeClients() {
+        for (sock in clientSockets) {
+            try { sock.close() } catch (e: Exception) { }
+        }
+        clientSockets.clear()
+    }
+
     @Synchronized
     private fun stopEverything() {
         serving = false
         MirrorState.running = false
         MirrorState.sessionToken = ""
-        // Close every accepted client socket: a /stream handler blocked in a
-        // socket write otherwise never wakes up, and the TV keeps its stream.
-        for (sock in clientSockets) {
-            try { sock.close() } catch (e: Exception) { }
-        }
-        clientSockets.clear()
+        closeClients()
         stopCapture()
         try { server?.close() } catch (e: Exception) { }
         server = null

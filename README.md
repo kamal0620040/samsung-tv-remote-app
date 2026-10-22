@@ -40,11 +40,18 @@ Requires a 2016+ Samsung TV (the :8002 protocol) and Android 8+ (minSdk 26).
 ## Building
 
 **Gradle (the standard way).** Open this folder in Android Studio and run
-the `app` module, or use Gradle from the command line. If `gradlew` is not
-present yet, Android Studio generates it on import, or run
-`gradle wrapper --gradle-version 8.9` once. Toolchain: Android Gradle Plugin
-8.7.3, Kotlin 2.0.21, compileSdk 35. Dependencies are deliberately few:
-Kotlin coroutines and OkHttp.
+the `app` module, or use Gradle from the command line. The Gradle wrapper
+JAR is committed (its SHA-256 matches the checksum Gradle publishes for
+8.9); if the `gradlew` scripts are missing, Android Studio generates them
+on import, or run `gradle wrapper --gradle-version 8.9` once with any
+Gradle install. Toolchain: Android Gradle Plugin 8.7.3, Kotlin 2.0.21,
+compileSdk 35. Dependencies are deliberately few: Kotlin coroutines and
+OkHttp.
+
+**Tests.** JUnit 5 unit tests live in `tvcore/src/test` and `app/src/test`
+(Range parsing, MAC validation, English/Nepali string parity):
+`gradle test`. A ready-to-enable GitHub Actions workflow is kept in
+`ci/github-actions.yml` (see the note at the top of that file).
 
 **build.sh (no Gradle).** The repo also carries a small explicit pipeline:
 
@@ -90,10 +97,11 @@ so it is reusable in other Android apps rather than as a pure JVM library.
   connection pins the TV's certificate; if the TV's certificate ever
   changes, the app refuses to connect until you choose to trust the new
   one.
-- Screen mirroring runs a small HTTP server on port 8080 so the TV's
-  browser can open the stream. Every address it serves includes a random
-  per-session token, and requests without it are refused, so other devices
-  on the same Wi-Fi cannot watch. The server stops with the cast.
+- Screen mirroring runs a small HTTP server on port 8080, bound to the
+  phone's Wi-Fi address, so the TV's browser can open the stream. Every
+  address it serves includes a random per-session token, and requests
+  without it are refused, so other devices on the same Wi-Fi cannot watch.
+  The server stops with the cast.
 - IR mode uses the phone's infrared blaster and needs no network at all.
 
 ## Troubleshooting

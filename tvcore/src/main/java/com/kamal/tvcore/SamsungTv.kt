@@ -62,11 +62,13 @@ data class TvApp(
  * and sends the exact message shapes the reference implementation sends.
  *
  * TLS: Samsung TVs present self-signed certificates with no hostname that
- * could pass normal verification, so trust is anchored by pinning instead:
- * the first connection to a TV stores its certificate fingerprint, and
- * later connections must present the same certificate. A changed
- * certificate fails the connection with lastError "cert" until the user
- * explicitly trusts the new one (which clears the pin and the token).
+ * could pass normal verification, so trust is anchored by pinning instead.
+ * Each connection gets its own trust manager bound to that TV and that
+ * connection attempt. A handshake only records a candidate fingerprint;
+ * the pin is stored once the channel actually connects, so a transient or
+ * wrong endpoint is never pinned silently. When a stored pin exists, a
+ * different certificate fails the connection with lastError "cert" until
+ * the user explicitly trusts the new one (see [trustPendingCertificate]).
  */
 class SamsungTv(
     private val remoteName: String = "Kamal Remote",
@@ -91,34 +93,59 @@ class SamsungTv(
     /** Incremented on every connect/disconnect; callbacks from older sockets are ignored. */
     @Volatile private var generation = 0
 
-    /** Host the trust manager should pin/verify; set before each connection attempt. */
-    @Volatile private var targetHost: String? = null
+    /** A certificate seen during a handshake, not yet promoted to a stored pin. */
+    private data class CandidatePin(val gen: Int, val host: String, val fingerprint: String)
 
-    private val http: OkHttpClient by lazy {
-        val pinning = object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
-            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
-                val store = certs ?: return // no store supplied: accept (documented fallback)
-                val host = targetHost ?: throw CertificateException("no target host")
-                if (chain.isEmpty()) throw CertificateException("empty certificate chain")
-                val fp = MessageDigest.getInstance("SHA-256")
-                    .digest(chain[0].encoded).joinToString("") { "%02x".format(it) }
-                val stored = store.get(host)
-                when {
-                    stored == null -> store.put(host, fp) // first sight: pin it
-                    stored != fp -> throw CertificateException("TV certificate changed")
-                }
+    @Volatile private var candidatePin: CandidatePin? = null
+
+    /** Fingerprint of the certificate the current TV presented but that does not match the stored pin. */
+    val pendingPinFingerprint: String?
+        get() = candidatePin
+            ?.takeIf { it.host == ip && certs?.get(it.host) != it.fingerprint }
+            ?.fingerprint
+
+    /**
+     * Trust the certificate the TV most recently presented (or, if none was
+     * recorded, forget the stored pin so the next connection re-pins).
+     * Callers should confirm with the user first and clear the pairing
+     * token, since a new certificate means a new pairing.
+     */
+    fun trustPendingCertificate() {
+        val host = ip ?: return
+        val candidate = candidatePin?.takeIf { it.host == host }
+        if (candidate != null) {
+            certs?.put(host, candidate.fingerprint)
+        } else {
+            certs?.remove(host)
+        }
+        candidatePin = null
+    }
+
+    private inner class PinningTrustManager(
+        private val host: String,
+        private val gen: Int,
+    ) : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+
+        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+            val store = certs ?: return // no store supplied: accept (documented fallback)
+            if (chain.isEmpty()) throw CertificateException("empty certificate chain")
+            val fp = MessageDigest.getInstance("SHA-256")
+                .digest(chain[0].encoded).joinToString("") { "%02x".format(it) }
+            // Record what this connection presented; promotion to a stored
+            // pin happens only when the channel connects (handleMessage).
+            candidatePin = CandidatePin(gen, host, fp)
+            val stored = store.get(host)
+            if (stored != null && stored != fp) {
+                throw CertificateException("TV certificate changed")
             }
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
         }
-        val ssl = SSLContext.getInstance("TLS").apply {
-            init(null, arrayOf(pinning), SecureRandom())
-        }
+
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+
+    private val baseHttp: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .sslSocketFactory(ssl.socketFactory, pinning)
-            // TV certificates carry no usable hostname; the pin above is the
-            // authentication, so hostname verification stays off by design.
-            .hostnameVerifier { _, _ -> true }
             .pingInterval(20, TimeUnit.SECONDS)
             .build()
     }
@@ -134,7 +161,6 @@ class SamsungTv(
             return
         }
         _state.value = ConnState.CONNECTING
-        targetHost = ip
         val gen = generation
         try {
             val nameB64 = Base64.encodeToString(remoteName.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -149,7 +175,20 @@ class SamsungTv(
                 }
                 .build()
             val req = Request.Builder().url(url).build()
-            ws = http.newWebSocket(req, object : WebSocketListener() {
+            // A trust manager bound to this host and this attempt, so a late
+            // handshake from an older socket can never verify against (or
+            // record a candidate for) the wrong TV.
+            val trustManager = PinningTrustManager(ip, gen)
+            val ssl = SSLContext.getInstance("TLS").apply {
+                init(null, arrayOf(trustManager), SecureRandom())
+            }
+            val client = baseHttp.newBuilder()
+                .sslSocketFactory(ssl.socketFactory, trustManager)
+                // TV certificates carry no usable hostname; the pin above is
+                // the authentication, so hostname verification stays off.
+                .hostnameVerifier { _, _ -> true }
+                .build()
+            ws = client.newWebSocket(req, object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (gen != generation) return // stale socket
                     handleMessage(text)
@@ -168,6 +207,7 @@ class SamsungTv(
                             msg.contains("after 10000ms", ignoreCase = true) -> "timeout"
                         else -> "failed"
                     }
+                    if (lastError != "cert") candidatePin = null // keep the candidate for the trust flow
                     _state.value = ConnState.ERROR
                     failPending(t)
                 }
@@ -184,10 +224,11 @@ class SamsungTv(
         }
     }
 
+    /** Only an actual certificate validation failure counts as "cert"; other TLS errors do not. */
     private fun isCertFailure(t: Throwable): Boolean {
         var cur: Throwable? = t
         while (cur != null) {
-            if (cur is CertificateException || cur is javax.net.ssl.SSLException) return true
+            if (cur is CertificateException) return true
             cur = cur.cause
         }
         return false
@@ -208,6 +249,13 @@ class SamsungTv(
                 val token = msg.optJSONObject("data")?.optString("token").orEmpty()
                 val myIp = ip
                 if (token.isNotEmpty() && myIp != null) tokens.put(myIp, token)
+                // The channel is really up: promote this connection's
+                // candidate certificate to the stored pin.
+                candidatePin?.let { candidate ->
+                    if (candidate.gen == generation && candidate.host == myIp) {
+                        certs?.put(candidate.host, candidate.fingerprint)
+                    }
+                }
                 _state.value = ConnState.CONNECTED
             }
             "ed.installedApp.get" -> {
@@ -251,6 +299,7 @@ class SamsungTv(
 
     fun disconnect() {
         generation++
+        candidatePin = null
         try { ws?.close(1000, null) } catch (e: Exception) { /* already closed */ }
         ws = null
         appsCache = null
@@ -298,7 +347,12 @@ class SamsungTv(
         )
     }
 
-    /** Installed apps on the TV (cached after the first successful fetch). Never throws. */
+    /**
+     * Installed apps on the TV (cached after the first successful fetch).
+     * A call that times out clears its pending request, so the next call
+     * sends a fresh request instead of awaiting a dead one forever.
+     * Cancellation of the caller is propagated, never swallowed.
+     */
     suspend fun getApps(timeoutMs: Long = 6_000): List<TvApp> {
         appsCache?.let { return it }
         val deferred = pendingApps ?: CompletableDeferred<List<TvApp>>().also { created ->
@@ -319,7 +373,22 @@ class SamsungTv(
             }
         }
         return try {
-            withTimeoutOrNull(timeoutMs) { deferred.await() } ?: emptyList()
+            val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
+            if (result == null) {
+                if (pendingApps === deferred) {
+                    pendingApps = null
+                    deferred.cancel()
+                }
+                emptyList()
+            } else {
+                result
+            }
+        } catch (e: CancellationException) {
+            if (pendingApps === deferred) {
+                pendingApps = null
+                deferred.cancel()
+            }
+            throw e
         } catch (e: Exception) {
             emptyList()
         }
@@ -327,32 +396,39 @@ class SamsungTv(
 
     /**
      * Fetch one app's icon (base64 PNG) via `ed.apps.icon` — the TV answers
-     * asynchronously with the image. Returns null on timeout/no icon. Never throws.
+     * asynchronously with the image. Concurrent calls for the same icon
+     * share one in-flight request. Returns null on timeout/no icon.
+     * Cancellation of the caller is propagated, never swallowed.
      */
     suspend fun getAppIcon(iconPath: String, timeoutMs: Long = 5_000): String? {
         if (iconPath.isEmpty()) return null
-        val deferred = CompletableDeferred<String?>()
-        pendingIcons[iconPath] = deferred
-        if (!send(
-                JSONObject()
-                    .put("method", "ms.channel.emit")
-                    .put(
-                        "params", JSONObject()
-                            .put("data", JSONObject().put("iconPath", iconPath))
-                            .put("event", "ed.apps.icon")
-                            .put("to", "host")
-                    )
-            )
-        ) {
-            pendingIcons.remove(iconPath)
-            return null
+        val mine = CompletableDeferred<String?>()
+        val existing = pendingIcons.putIfAbsent(iconPath, mine)
+        val deferred = existing ?: mine
+        if (existing == null) {
+            if (!send(
+                    JSONObject()
+                        .put("method", "ms.channel.emit")
+                        .put(
+                            "params", JSONObject()
+                                .put("data", JSONObject().put("iconPath", iconPath))
+                                .put("event", "ed.apps.icon")
+                                .put("to", "host")
+                        )
+                )
+            ) {
+                pendingIcons.remove(iconPath, mine)
+                return null
+            }
         }
         return try {
             withTimeoutOrNull(timeoutMs) { deferred.await() }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             null
         } finally {
-            pendingIcons.remove(iconPath)
+            if (existing == null) pendingIcons.remove(iconPath, mine)
         }
     }
 

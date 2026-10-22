@@ -122,7 +122,7 @@ class MainActivity : Activity() {
     private val irRepeater = object : Runnable {
         override fun run() {
             val key = irRepeatKey ?: return
-            thread { ir.send(key) }
+            irExecutor.execute { ir.send(key) }
             irHandler.postDelayed(this, 130)
         }
     }
@@ -149,17 +149,33 @@ class MainActivity : Activity() {
             returnTab = savedInstanceState.getString("returnTab", "touchpad") ?: "touchpad"
             mirrorQuality = savedInstanceState.getInt("mirrorQuality", 1)
         }
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            // Without this, the mirroring notification (and its STOP action)
+            // is silently suppressed on Android 13+.
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 94)
+        }
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
                 android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT
             ) { if (!handleBack()) finish() }
         }
         val saved = prefs.savedIp
+        val restored = savedInstanceState != null
         when {
             mode == "ir" -> showMain(tab)
+            restored && screen == "help" -> showHelp()
+            restored && screen == "search" -> showSearch()
             saved != null -> {
                 tv.connect(saved)
-                if (savedInstanceState != null && screen == "mirror") showMirror() else showMain(tab)
+                when {
+                    restored && screen == "mirror" -> showMirror()
+                    restored && screen == "apps" -> showApps()
+                    restored && screen == "input" -> showInput()
+                    else -> showMain(tab)
+                }
             }
             else -> showSearch()
         }
@@ -175,7 +191,12 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        if (isFinishing) tv.disconnect() // don't leak the TV socket past the activity
+        // Always disconnect: on a non-finishing recreation this instance's
+        // socket would otherwise leak; the new instance reconnects itself.
+        tv.disconnect()
+        irRepeatKey = null
+        irHandler.removeCallbacks(irRepeater)
+        irExecutor.shutdownNow()
         scope.cancel()
         super.onDestroy()
     }
@@ -201,9 +222,18 @@ class MainActivity : Activity() {
 
     // ---------------- key routing ----------------
 
+    /** Single background thread for IR sends, so a held key never spawns a thread per repeat. */
+    private val irExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    /** Connect, dropping cached icons when switching to a different TV. */
+    private fun connectTo(ip: String) {
+        if (ip != tv.ip) iconCache.clear()
+        tv.connect(ip)
+    }
+
     private fun pressKey(key: String) {
         if (mode == "ir") {
-            thread { ir.send(key) }
+            irExecutor.execute { ir.send(key) }
         } else {
             tv.click(key)
         }
@@ -216,7 +246,7 @@ class MainActivity : Activity() {
                     v.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
                     v.isPressed = true
                     if (mode == "ir") {
-                        thread { ir.send(key) }
+                        irExecutor.execute { ir.send(key) }
                         // IR has no press/release pair: repeat while held.
                         irRepeatKey = key
                         irHandler.removeCallbacks(irRepeater)
@@ -253,9 +283,10 @@ class MainActivity : Activity() {
     }
 
     /** Round icon button on a panel circle, like the reference's image buttons. */
-    private fun iconBtn(name: String, tint: Int = ON_BG, boxDp: Float = 56f, iconDp: Float = 26f): FrameLayout {
+    private fun iconBtn(name: String, tint: Int = ON_BG, boxDp: Float = 56f, iconDp: Float = 26f, desc: String? = null): FrameLayout {
         val box = FrameLayout(this)
         box.background = oval(PANEL)
+        if (desc != null) box.contentDescription = desc
         val iv = icon(name, iconDp, tint)
         iv.layoutParams = FrameLayout.LayoutParams(dp(iconDp), dp(iconDp), Gravity.CENTER)
         box.addView(iv)
@@ -404,13 +435,11 @@ class MainActivity : Activity() {
         retry.tap {
             val ip = prefs.savedIp
             if (ip != null) {
-                // A changed TV certificate needs an explicit re-trust: drop
-                // the pin and the pairing token, then pair fresh.
                 if (tv.lastError == "cert") {
-                    prefs.certs.remove(ip)
-                    prefs.tokens.remove(ip)
+                    certTrustDialog(ip)
+                } else {
+                    tv.connect(ip)
                 }
-                tv.connect(ip)
             }
         }
         actions.addView(retry)
@@ -440,6 +469,28 @@ class MainActivity : Activity() {
         }
         bannerCard = wrap
         return wrap
+    }
+
+    /**
+     * A changed TV certificate is a security decision, not a retry: show
+     * the fingerprint the TV presented and trust it only after an explicit
+     * confirmation. Trusting stores the new pin and drops the pairing
+     * token, so the TV will ask to pair again.
+     */
+    private fun certTrustDialog(ip: String) {
+        val fp = tv.pendingPinFingerprint
+        val message = Strings.t("cert_confirm") +
+            (fp?.let { "\n\n" + it.uppercase().chunked(4).joinToString(" ") } ?: "")
+        android.app.AlertDialog.Builder(this)
+            .setTitle(Strings.t("trust_new"))
+            .setMessage(message)
+            .setPositiveButton(Strings.t("trust_new")) { _, _ ->
+                tv.trustPendingCertificate()
+                prefs.tokens.remove(ip)
+                tv.connect(ip)
+            }
+            .setNegativeButton(Strings.t("cancel"), null)
+            .show()
     }
 
     private fun refreshBanner() {
@@ -521,14 +572,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val power = iconBtn("ic_power", DANGER, 56f, 24f)
+        val power = iconBtn("ic_power", DANGER, 56f, 24f, desc = Strings.t("power"))
         power.tap { pressKey("KEY_POWER") }
         top.addView(power)
         top.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        val guide = iconBtn("ic_guide", ON_BG, 56f, 24f)
+        val guide = iconBtn("ic_guide", ON_BG, 56f, 24f, desc = Strings.t("guide"))
         guide.tap { pressKey("KEY_GUIDE") }
         top.addView(guide)
-        val source = iconBtn("ic_source", ON_BG, 56f, 24f)
+        val source = iconBtn("ic_source", ON_BG, 56f, 24f, desc = Strings.t("source"))
         source.tap { pressKey("KEY_SOURCE") }
         top.addView(source, LinearLayout.LayoutParams(dp(56f), dp(56f)).apply { leftMargin = dp(12f) })
         root.addView(top, LinearLayout.LayoutParams(-1, dp(56f)))
@@ -603,6 +654,10 @@ class MainActivity : Activity() {
         val (down, downIcon) = arrow(270f, "KEY_DOWN")
         val (left, leftIcon) = arrow(0f, "KEY_LEFT")
         val (right, rightIcon) = arrow(180f, "KEY_RIGHT")
+        up.contentDescription = Strings.t("dir_up")
+        down.contentDescription = Strings.t("dir_down")
+        left.contentDescription = Strings.t("dir_left")
+        right.contentDescription = Strings.t("dir_right")
         stage.addView(up); stage.addView(down); stage.addView(left); stage.addView(right)
 
         val ok = FrameLayout(this)
@@ -610,6 +665,7 @@ class MainActivity : Activity() {
         val okLabel = label("OK", 16f, Color.WHITE, bold = true, gravity = Gravity.CENTER)
         okLabel.layoutParams = FrameLayout.LayoutParams(-2, -2, Gravity.CENTER)
         ok.addView(okLabel)
+        ok.contentDescription = "OK"
         ok.tap { pressKey("KEY_ENTER") }
         stage.addView(ok)
 
@@ -644,18 +700,19 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             background = rounded(PANEL2, 24f, this@MainActivity)
         }
-        fun zone(iconName: String, key: String): LinearLayout {
+        fun zone(iconName: String, key: String, descKey: String): LinearLayout {
             val z = LinearLayout(this).apply { gravity = Gravity.CENTER }
+            z.contentDescription = Strings.t(labelKey) + " " + Strings.t(descKey)
             z.addView(icon(iconName, 24f, ON_BG))
             holdable(z, key)
             return z
         }
-        pill.addView(zone("ic_plus", upKey), LinearLayout.LayoutParams(-1, 0, 1f))
+        pill.addView(zone("ic_plus", upKey, "dir_up"), LinearLayout.LayoutParams(-1, 0, 1f))
         pill.addView(
             label(Strings.t(labelKey), 12f, DIM, bold = true, gravity = Gravity.CENTER),
             LinearLayout.LayoutParams(-1, -2)
         )
-        pill.addView(zone("ic_minus", downKey), LinearLayout.LayoutParams(-1, 0, 1f))
+        pill.addView(zone("ic_minus", downKey, "dir_down"), LinearLayout.LayoutParams(-1, 0, 1f))
         pill.layoutParams = LinearLayout.LayoutParams(dp(76f), -1)
         return pill
     }
@@ -1075,14 +1132,21 @@ class MainActivity : Activity() {
     /** Poll the mirror server until it answers (or ~4s pass) instead of guessing with a fixed delay. */
     private suspend fun waitForMirrorServer() {
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val url = java.net.URL("http://127.0.0.1:${MirrorState.PORT}/?t=${MirrorState.token()}")
+            val url = java.net.URL("http://${MirrorState.localIp() ?: "127.0.0.1"}:${MirrorState.PORT}/?t=${MirrorState.token()}")
             repeat(20) {
+                var conn: java.net.HttpURLConnection? = null
                 try {
-                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn = url.openConnection() as java.net.HttpURLConnection
                     conn.connectTimeout = 300
                     conn.readTimeout = 300
-                    if (conn.responseCode == 200) return@withContext
-                } catch (e: Exception) { /* server not up yet */ }
+                    // In media mode "/" redirects to the watch page; the
+                    // redirect itself already proves the server is up.
+                    conn.instanceFollowRedirects = false
+                    val code = conn.responseCode
+                    if (code == 200 || code == 302) return@withContext
+                } catch (e: Exception) { /* server not up yet */ } finally {
+                    conn?.disconnect()
+                }
                 delay(200)
             }
         }
@@ -1116,7 +1180,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val close = iconBtn("ic_close", ON_BG, 48f, 24f)
+        val close = iconBtn("ic_close", ON_BG, 48f, 24f, desc = Strings.t("close"))
         close.tap { showMain(returnTab) }
         top.addView(close)
         top.addView(label(Strings.t("apps"), 20f, ON_BG, bold = true).apply {
@@ -1218,7 +1282,7 @@ class MainActivity : Activity() {
             setPadding(dp(24f), dp(12f), dp(24f), dp(16f))
         }
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val close = iconBtn("ic_close", ON_BG, 48f, 24f)
+        val close = iconBtn("ic_close", ON_BG, 48f, 24f, desc = Strings.t("close"))
         close.tap { showMain(returnTab) }
         top.addView(close)
         root.addView(top)
@@ -1434,7 +1498,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val close = iconBtn("ic_close", ON_BG, 48f, 24f)
+        val close = iconBtn("ic_close", ON_BG, 48f, 24f, desc = Strings.t("close"))
         close.tap { showMain("settings") }
         top.addView(close)
         top.addView(label(Strings.t("help"), 20f, ON_BG, bold = true).apply {
@@ -1583,7 +1647,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val close = iconBtn("ic_close", ON_BG, 48f, 24f)
+        val close = iconBtn("ic_close", ON_BG, 48f, 24f, desc = Strings.t("close"))
         close.tap { if (tv.connected) showMain(tab) else finish() }
         val rescan = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1707,7 +1771,7 @@ class MainActivity : Activity() {
             prefs.savedIp = dev.ip
             prefs.savedName = dev.name
             prefs.savedModel = dev.model
-            tv.connect(dev.ip)
+            connectTo(dev.ip)
             showMain("remote")
         }
         card.enterFx(list.childCount)
@@ -1752,7 +1816,7 @@ class MainActivity : Activity() {
                     prefs.savedIp = ip
                     prefs.savedName = null
                     prefs.savedModel = null
-                    tv.connect(ip)
+                    connectTo(ip)
                     showMain("remote")
                 }
             }
