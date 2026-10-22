@@ -60,10 +60,12 @@ the top of the script. It needs JDK 21 and Android SDK 35 (build-tools
 35.0.0); tool locations are overridable through `JAVA_HOME`, `ANDROID_HOME`,
 `M2` and `KEYSTORE`.
 
-Either way the result is signed with the standard Android debug key for
-sideloading. For anything beyond personal use, generate a personal keystore
-and keep signing with it: Android only accepts updates signed by the same
-key.
+Signing: build.sh and Gradle debug builds are signed with the standard
+Android debug key. A Gradle release build is unsigned unless you create
+`app/keystore.properties` pointing at your own keystore (see
+`app/build.gradle.kts`). For anything beyond personal use, sign with a
+personal keystore and keep using it: Android only accepts updates signed
+by the same key.
 
 ## Project structure
 
@@ -75,8 +77,38 @@ build.sh      the no-Gradle build pipeline
 ```
 
 The UI is plain framework Views with layouts built in code: no AndroidX, no
-Compose, no XML layouts, no generated R class. `tvcore` has no Android UI
-dependencies and can be reused on its own.
+Compose, no XML layouts, no generated R class. `tvcore` is an Android
+library with no UI dependencies; it does use Android's Base64 and org.json,
+so it is reusable in other Android apps rather than as a pure JVM library.
+
+## Permissions and privacy
+
+- Network permissions (internet, Wi-Fi state, multicast) are used only to
+  find and talk to your TV on your own network. Nothing leaves the LAN.
+- The pairing token and the TV's certificate fingerprint are stored only on
+  the phone, and Android backups are disabled for this app. The first
+  connection pins the TV's certificate; if the TV's certificate ever
+  changes, the app refuses to connect until you choose to trust the new
+  one.
+- Screen mirroring runs a small HTTP server on port 8080 so the TV's
+  browser can open the stream. Every address it serves includes a random
+  per-session token, and requests without it are refused, so other devices
+  on the same Wi-Fi cannot watch. The server stops with the cast.
+- IR mode uses the phone's infrared blaster and needs no network at all.
+
+## Troubleshooting
+
+- **TV not found:** the TV must be on (not in deep standby) and on the same
+  Wi-Fi as the phone. Some routers block multicast between bands; try the
+  same band for both, or use Enter IP manually.
+- **"Certificate changed" error:** the TV was replaced, reset, or its
+  certificate rotated. If the change is expected, tap Trust new
+  certificate to pair again.
+- **Mirroring will not start, port busy:** another app is using port 8080.
+  The mirror screen shows this error; close that app and try again.
+- **TV asks for approval every time:** the saved pairing token was cleared
+  (for example after trusting a new certificate). Accept the prompt once
+  and it is saved again.
 
 ## Honest limits
 

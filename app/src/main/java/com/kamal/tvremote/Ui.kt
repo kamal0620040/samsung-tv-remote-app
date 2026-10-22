@@ -20,7 +20,6 @@ import android.widget.TextView
  * curve, short durations, transform and opacity only, nothing from scale 0.
  */
 val EASE_OUT: TimeInterpolator = PathInterpolator(0.23f, 1f, 0.32f, 1f)
-val EASE_IN_OUT: TimeInterpolator = PathInterpolator(0.77f, 0f, 0.175f, 1f)
 
 fun View.animsOn(): Boolean =
     Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f
@@ -39,16 +38,6 @@ fun View.enterFx(index: Int = 0) {
     }
 }
 
-/** Small settle pop, used for the selected bottom-nav icon. */
-fun View.popFx() {
-    if (!animsOn()) return
-    post {
-        scaleX = 0.82f
-        scaleY = 0.82f
-        animate().scaleX(1f).scaleY(1f).setInterpolator(EASE_OUT).setDuration(220).start()
-    }
-}
-
 fun Context.dp(v: Float): Int = TypedValue.applyDimension(
     TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics
 ).toInt()
@@ -58,11 +47,6 @@ fun rounded(color: Int, radiusDp: Float, ctx: Context, strokeColor: Int? = null)
         setColor(color)
         cornerRadius = ctx.dp(radiusDp).toFloat()
         if (strokeColor != null) setStroke(ctx.dp(1f), strokeColor)
-    }
-
-fun gradient(top: Int, bottom: Int, radiusDp: Float, ctx: Context): GradientDrawable =
-    GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(top, bottom)).apply {
-        cornerRadius = ctx.dp(radiusDp).toFloat()
     }
 
 fun oval(color: Int): GradientDrawable =
@@ -98,6 +82,20 @@ fun Context.hairline(): View = View(this).apply {
     layoutParams = android.view.ViewGroup.LayoutParams(-1, dp(1f))
 }
 
+/** [left, top, right, bottom] bar insets, using the current WindowInsets API where available. */
+private fun barInsets(insets: android.view.WindowInsets): IntArray {
+    return if (android.os.Build.VERSION.SDK_INT >= 30) {
+        val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars())
+        intArrayOf(bars.left, bars.top, bars.right, bars.bottom)
+    } else {
+        @Suppress("DEPRECATION")
+        intArrayOf(
+            insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+            insets.systemWindowInsetRight, insets.systemWindowInsetBottom
+        )
+    }
+}
+
 /**
  * Edge-to-edge insets: pads the root with the status-bar height at the top
  * and the navigation-bar height at the bottom, preserving its own padding.
@@ -108,13 +106,27 @@ fun View.applySystemInsets() {
     val baseRight = paddingRight
     val baseBottom = paddingBottom
     setOnApplyWindowInsetsListener { v, insets ->
-        @Suppress("DEPRECATION")
-        v.setPadding(
-            baseLeft + insets.systemWindowInsetLeft,
-            baseTop + insets.systemWindowInsetTop,
-            baseRight + insets.systemWindowInsetRight,
-            baseBottom + insets.systemWindowInsetBottom
-        )
+        val b = barInsets(insets)
+        v.setPadding(baseLeft + b[0], baseTop + b[1], baseRight + b[2], baseBottom + b[3])
+        insets
+    }
+    requestApplyInsets()
+}
+
+/** Like [applySystemInsets], but the bottom padding also clears the on-screen keyboard. */
+fun View.applySystemInsetsIme() {
+    val baseLeft = paddingLeft
+    val baseTop = paddingTop
+    val baseRight = paddingRight
+    val baseBottom = paddingBottom
+    setOnApplyWindowInsetsListener { v, insets ->
+        val b = barInsets(insets)
+        var bottom = b[3]
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            val ime = insets.getInsets(android.view.WindowInsets.Type.ime()).bottom
+            if (ime > bottom) bottom = ime
+        }
+        v.setPadding(baseLeft + b[0], baseTop + b[1], baseRight + b[2], baseBottom + bottom)
         insets
     }
     requestApplyInsets()
