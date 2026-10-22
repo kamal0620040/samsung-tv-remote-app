@@ -50,8 +50,9 @@ OkHttp.
 
 **Tests.** JUnit 5 unit tests live in `tvcore/src/test` and `app/src/test`
 (Range parsing, MAC validation, TV address validation, English/Nepali string parity):
-`gradle test`. A ready-to-enable GitHub Actions workflow is kept in
-`ci/github-actions.yml` (see the note at the top of that file).
+`gradle test`. The GitHub Actions workflow in `.github/workflows/ci.yml`
+runs the unit tests, lint, and a debug build on every push and pull
+request.
 
 **build.sh (no Gradle).** The repo also carries a small explicit pipeline:
 
