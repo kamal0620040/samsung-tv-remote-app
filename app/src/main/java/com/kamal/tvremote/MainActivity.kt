@@ -116,6 +116,7 @@ class MainActivity : Activity() {
     private var searchTitle: TextView? = null
     private var searchProgress: ProgressBar? = null
     private var scanGen = 0
+    private var scanJob: kotlinx.coroutines.Job? = null
     private var bannerRetry: TextView? = null
     private val iconCache = java.util.Collections.synchronizedMap(HashMap<String, android.graphics.Bitmap>())
     private val iconGate = kotlinx.coroutines.sync.Semaphore(4)
@@ -251,6 +252,11 @@ class MainActivity : Activity() {
     }
 
     private fun holdable(view: View, key: String) {
+        // Accessibility activation (a TalkBack double-tap) arrives as a
+        // click, not as touch events: give it a single-press equivalent.
+        // Touch users never see this fire; the touch listener below
+        // consumes their events before a click can be dispatched.
+        view.setOnClickListener { pressKey(key) }
         view.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -792,6 +798,13 @@ class MainActivity : Activity() {
             val b = label(letter, 12f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
                 background = rippleKey(color, 16f)
             }
+            // TalkBack should hear the color name, not just the letter.
+            b.contentDescription = when (key) {
+                "KEY_RED" -> Strings.t("col_red") + " " + letter
+                "KEY_GREEN" -> Strings.t("col_green") + " " + letter
+                "KEY_YELLOW" -> Strings.t("col_yellow") + " " + letter
+                else -> Strings.t("col_blue") + " " + letter
+            }
             b.tap { pressKey(key) }
             colors.addView(b, LinearLayout.LayoutParams(0, dp(48f), 1f).apply {
                 if (i > 0) leftMargin = dp(8f)
@@ -977,6 +990,14 @@ class MainActivity : Activity() {
         card("ic_audio", Strings.t("audio")) { pickMedia("audio") }
         root.addView(grid, LinearLayout.LayoutParams(-1, -2))
 
+        // A failed cast leaves its error here, not only in a toast that
+        // disappears after a few seconds.
+        if (MirrorState.error != null) {
+            root.addView(label(mirrorErrorText(), 13f, DANGER).apply {
+                setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12f) })
+        }
+
         // A running media cast gets its stop control here (the mirror screen
         // only covers screen mirroring).
         if (MirrorState.running && MirrorState.mode == "media") {
@@ -1081,7 +1102,7 @@ class MainActivity : Activity() {
         val mErr = MirrorState.error
         if (!running && mErr != null) {
             body.addView(label(
-                if (mErr == "port_busy") Strings.t("mirror_port_busy") else Strings.t("err_failed"),
+                mirrorErrorText(),
                 12f, DANGER, gravity = Gravity.CENTER
             ).apply {
                 layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16f) }
@@ -1156,7 +1177,9 @@ class MainActivity : Activity() {
     private suspend fun waitForMirrorServer(): Boolean {
         if (MirrorState.error != null) return false
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val host = MirrorState.boundIp ?: MirrorState.localIp() ?: "127.0.0.1"
+            // Only an address the TV can actually open counts as "up";
+            // a loopback probe would prove nothing about TV reachability.
+            val host = MirrorState.boundIp ?: MirrorState.localIp() ?: return@withContext false
             val url = java.net.URL("http://$host:${MirrorState.PORT}/?t=${MirrorState.token()}")
             repeat(20) {
                 if (MirrorState.error != null) return@withContext false
@@ -1180,16 +1203,25 @@ class MainActivity : Activity() {
     }
 
     /** The mirror failure as a user message (port busy has its own string). */
-    private fun mirrorErrorText(): String =
-        if (MirrorState.error == "port_busy") Strings.t("mirror_port_busy") else Strings.t("err_failed")
+    private fun mirrorErrorText(): String = when (MirrorState.error) {
+        "port_busy" -> Strings.t("mirror_port_busy")
+        "no_network" -> Strings.t("mirror_no_network")
+        else -> Strings.t("err_failed")
+    }
 
     /** Launch the TV browser and type the URL (same trick as the reference). */
     private fun openOnTv(url: String) {
         if (mode == "wifi" && tv.connected) {
             scope.launch {
-                tv.launchApp(SamsungTv.APP_BROWSER)
+                if (!tv.launchApp(SamsungTv.APP_BROWSER)) {
+                    toast(Strings.t("err_failed"))
+                    return@launch
+                }
                 delay(3500)
-                tv.sendText(url)
+                if (!tv.sendText(url)) {
+                    toast(Strings.t("err_failed"))
+                    return@launch
+                }
                 delay(500)
                 tv.click("KEY_ENTER")
             }
@@ -1232,7 +1264,14 @@ class MainActivity : Activity() {
             return
         }
         scope.launch {
-            val apps = tv.getApps().filter { it.isVisible && it.appId.isNotEmpty() }
+            val apps = try {
+                tv.getApps().filter { it.isVisible && it.appId.isNotEmpty() }
+            } catch (e: IllegalStateException) {
+                // Transport failure (timeout, disconnect, send failure):
+                // that is not the same thing as a TV with no apps.
+                status.text = Strings.t("err_failed")
+                return@launch
+            }
             if (apps.isEmpty()) {
                 status.text = Strings.t("apps_empty")
                 return@launch
@@ -1529,6 +1568,7 @@ class MainActivity : Activity() {
                             prefs.tokens.remove(ip)
                             prefs.certs.remove(ip)
                         }
+                        iconCache.clear() // the forgotten TV's icons must not outlive it
                         tv.disconnect()
                         prefs.savedIp = null
                         prefs.savedName = null
@@ -1781,7 +1821,8 @@ class MainActivity : Activity() {
         val lock = wifi.createMulticastLock("kamal-tv-remote")
         lock.setReferenceCounted(false)
         lock.acquire()
-        scope.launch {
+        scanJob?.cancel() // a rescan supersedes the previous discovery run
+        scanJob = scope.launch {
             val found = try {
                 SsdpDiscovery.discover(4000)
             } catch (e: Exception) {
@@ -1932,6 +1973,7 @@ class MainActivity : Activity() {
                         if (waitForMirrorServer()) {
                             openOnTv(MirrorState.watchUrl())
                             toast(Strings.t("media_opening") + " " + MirrorState.watchUrl())
+                            showMain("mirroring") // rebuild the tab so the stop row appears now, not on re-entry
                         } else {
                             toast(mirrorErrorText())
                             showMain("mirroring")

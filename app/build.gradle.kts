@@ -11,8 +11,10 @@ val versionProps = Properties().apply {
     val f = rootProject.file("version.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
-val appVersionCode = (versionProps.getProperty("versionCode") ?: "13").toInt()
-val appVersionName = versionProps.getProperty("versionName") ?: "1.12"
+val appVersionCode = (versionProps.getProperty("versionCode")
+    ?: error("version.properties is missing versionCode")).toInt()
+val appVersionName = versionProps.getProperty("versionName")
+    ?: error("version.properties is missing versionName")
 
 // Optional release signing: create keystore.properties next to this file
 // (storeFile, storePassword, keyAlias, keyPassword) and it is picked up.

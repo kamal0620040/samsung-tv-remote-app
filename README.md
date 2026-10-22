@@ -95,7 +95,9 @@ so it is reusable in other Android apps rather than as a pure JVM library.
   find and talk to your TV on your own network. Nothing leaves the LAN.
 - TVs and their browsers speak plain HTTP on the LAN (UPnP descriptions,
   the mirror stream), so the app permits cleartext HTTP through its
-  network security config. The control connection to the TV itself is
+  network security config. Discovery only ever fetches a description
+  from the device that answered, at that device's own address, and
+  never follows redirects. The control connection to the TV itself is
   encrypted (wss) and pinned to the TV's certificate.
 - The pairing token and the TV's certificate fingerprint are stored only on
   the phone, and Android backups are disabled for this app. The first

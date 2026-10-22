@@ -2,6 +2,7 @@ package com.kamal.tvcore
 
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -47,12 +48,17 @@ object SsdpDiscovery {
             .connectTimeout(2, TimeUnit.SECONDS)
             .readTimeout(2, TimeUnit.SECONDS)
             .callTimeout(2, TimeUnit.SECONDS)
+            // The description URL comes from an unauthenticated SSDP
+            // response: never let it bounce the request somewhere else.
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
     }
 
     /** A discovered candidate; [strong] means it answered the Samsung-specific search target or named Samsung in its USN. */
     private class Candidate(val device: TvDevice, val strong: Boolean)
 
+    @OptIn(ExperimentalCoroutinesApi::class) // Deferred.getCompletionExceptionOrNull, used in the timeout fallback
     suspend fun discover(timeoutMs: Long = 4_000): List<TvDevice> = withContext(Dispatchers.IO) {
         val found = linkedMapOf<String, Candidate>()
         var socket: DatagramSocket? = null
@@ -144,7 +150,7 @@ object SsdpDiscovery {
     private suspend fun enrich(candidate: Candidate): TvDevice? {
         val dev = candidate.device
         val loc = dev.location ?: return dev
-        val xml = fetchDescription(loc) ?: return dev
+        val xml = fetchDescription(loc, dev.ip) ?: return dev
         val (name, model, maker) = parseDescription(xml)
         if (maker != null && !maker.lowercase().contains("samsung")) return null
         if (maker == null && !candidate.strong) return null
@@ -159,19 +165,37 @@ object SsdpDiscovery {
      * any failure, including a malformed LOCATION from an untrusted SSDP
      * response, yields null so one bad device cannot fail the whole scan.
      * The body is capped because the responder is untrusted.
+     *
+     * The LOCATION is validated against the responder's own address first:
+     * the fetch may only ever go to the device that answered, over plain
+     * HTTP (the client additionally refuses redirects). An SSDP response
+     * must not become a way to make the phone fetch arbitrary URLs.
      */
-    @OptIn(InternalCoroutinesApi::class) // tryResume resumes only when not already cancelled or resumed
-    private suspend fun fetchDescription(location: String): String? {
+    @OptIn(InternalCoroutinesApi::class) // tryResume hands back a token; completeResume(token) is what actually resumes
+    private suspend fun fetchDescription(location: String, expectedHost: String): String? {
+        val url = try {
+            java.net.URL(location)
+        } catch (e: Exception) {
+            return null
+        }
+        if (url.protocol != "http" || !url.host.equals(expectedHost, ignoreCase = true)) return null
         val request = try {
-            Request.Builder().url(location).build()
+            Request.Builder().url(url).build()
         } catch (e: Exception) {
             return null
         }
         return suspendCancellableCoroutine { cont ->
+            // tryResume alone only claims the continuation and returns a
+            // token; without completeResume the coroutine never resumes
+            // and the caller hangs until its timeout (the v1.13 bug).
+            fun resumeOnce(value: String?) {
+                val token = cont.tryResume(value)
+                if (token != null) cont.completeResume(token)
+            }
             val call = try {
                 http.newCall(request)
             } catch (e: Exception) {
-                cont.tryResume(null)
+                resumeOnce(null)
                 return@suspendCancellableCoroutine
             }
             cont.invokeOnCancellation {
@@ -179,7 +203,7 @@ object SsdpDiscovery {
             }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    cont.tryResume(null)
+                    resumeOnce(null)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -193,7 +217,7 @@ object SsdpDiscovery {
                     } catch (e: Exception) {
                         null
                     }
-                    cont.tryResume(body)
+                    resumeOnce(body)
                 }
             })
         }

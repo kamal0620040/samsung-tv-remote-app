@@ -13,7 +13,11 @@ object HttpRange {
      * ignore headers that fail this check entirely (answering 200 with the
      * full body, as RFC 9110 allows) instead of guessing.
      */
-    fun isRangeHeader(header: String): Boolean = RANGE_REGEX.containsMatchIn(header.trim())
+    fun isRangeHeader(header: String): Boolean {
+        val m = RANGE_REGEX.find(header.trim()) ?: return false
+        // "bytes=-" matches the shape but names no bound at all: not a Range.
+        return m.groupValues[1].isNotEmpty() || m.groupValues[2].isNotEmpty()
+    }
 
     /**
      * Resolve a Range header against the file size. Returns [start, end]

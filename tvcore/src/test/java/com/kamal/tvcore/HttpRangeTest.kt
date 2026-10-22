@@ -52,6 +52,7 @@ class HttpRangeTest {
         assertTrue(HttpRange.isRangeHeader("bytes=0-"))
         assertTrue(HttpRange.isRangeHeader("bytes=100-199"))
         assertTrue(HttpRange.isRangeHeader("bytes=-500"))
+        assertFalse(HttpRange.isRangeHeader("bytes=-")) // a shape with no bound at all is not a Range
         assertFalse(HttpRange.isRangeHeader("garbage"))
         assertFalse(HttpRange.isRangeHeader("bytes=10-20 trailing"))
         assertFalse(HttpRange.isRangeHeader("xbytes=10-20"))

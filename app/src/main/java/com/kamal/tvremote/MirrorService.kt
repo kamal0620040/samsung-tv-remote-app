@@ -118,7 +118,7 @@ class MirrorService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var bgThread: HandlerThread? = null
-    private var lastFrameAt = 0L
+    @Volatile private var lastFrameAt = 0L
 
     /** Incremented whenever a capture starts or is torn down, so a stopped projection's late callback can tell it is stale. */
     @Volatile private var captureSession = 0
@@ -169,6 +169,13 @@ class MirrorService : Service() {
                         stopEverything()
                         stopSelf()
                     }
+                } else {
+                    // A mirror intent without its projection data can never
+                    // produce frames; fail instead of serving a black cast.
+                    MirrorState.error = "capture_failed"
+                    stopEverything()
+                    stopSelf()
+                    return START_NOT_STICKY
                 }
             }
         }
@@ -298,10 +305,31 @@ class MirrorService : Service() {
             "KamalMirror", w, h, metrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imgReader.surface, null, handler
-        )
+            // A null display means no frame will ever arrive; the caller's
+            // catch turns this into a clean capture_failed instead of a
+            // "running" cast showing a black screen.
+        ) ?: throw IllegalStateException("createVirtualDisplay returned null")
     }
 
     // ---------------- HTTP server ----------------
+
+    /** True while [ip] is still assigned to one of this device's interfaces. */
+    private fun isLocalAddress(ip: String): Boolean {
+        return try {
+            val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
+            while (ifaces.hasMoreElements()) {
+                val addrs = ifaces.nextElement().inetAddresses
+                while (addrs.hasMoreElements()) {
+                    if (addrs.nextElement().hostAddress == ip) return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            // Cannot tell: keep the running server rather than kill a
+            // working cast on a transient enumeration failure.
+            true
+        }
+    }
 
     /**
      * Bind the server socket on the calling thread, then run the accept
@@ -311,20 +339,29 @@ class MirrorService : Service() {
      */
     @Synchronized
     private fun startServer(): Boolean {
-        if (serving) return true
+        if (serving) {
+            // If the address we bound has vanished (the Wi-Fi network
+            // changed), the running server is unreachable at the URL the
+            // TV was given: tear it down and bind fresh below instead of
+            // serving a dead cast.
+            val bound = MirrorState.boundIp
+            if (bound == null || isLocalAddress(bound)) return true
+            stopEverything()
+        }
         MirrorState.token() // make sure a token exists before anyone connects
         // Bind to the phone's LAN address (the same address the TV is given
-        // in the URL), not to every interface; fall back to all interfaces
-        // when no LAN address is known.
+        // in the URL), never to every interface. Without a usable LAN
+        // address there is no URL a TV could open, so refuse to start.
+        val bindIp = MirrorState.localIp()
+        if (bindIp == null) {
+            MirrorState.error = "no_network"
+            MirrorState.running = false
+            return false
+        }
         val ss = try {
-            val bindAddress = MirrorState.localIp()?.let { InetAddress.getByName(it) }
-            if (bindAddress != null) {
-                ServerSocket(MirrorState.PORT, 50, bindAddress)
-            } else {
-                ServerSocket(MirrorState.PORT)
-            }
+            ServerSocket(MirrorState.PORT, 50, InetAddress.getByName(bindIp))
         } catch (e: Exception) {
-            MirrorState.error = "port_busy"
+            MirrorState.error = if (e is java.net.BindException) "port_busy" else "no_network"
             MirrorState.running = false
             return false
         }
@@ -341,12 +378,14 @@ class MirrorService : Service() {
                     ss.accept()
                 } catch (e: Exception) {
                     // A close from stopEverything (serving already false)
-                    // is the normal stop; anything else is a real failure
-                    // and must not leave the UI claiming "running".
+                    // is the normal stop; anything else is a real failure:
+                    // run the full cleanup so no socket, notification, or
+                    // "running" claim survives a server that accepts nothing.
                     if (serving) {
-                        serving = false
-                        MirrorState.running = false
+                        stopEverything()
                         MirrorState.error = "accept_failed"
+                        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (e2: Exception) { }
+                        stopSelf()
                     }
                     break
                 }
@@ -563,7 +602,8 @@ img,video{max-width:100%;max-height:100%}audio{width:80%}</style></head><body>$t
             if (skipped > 0) {
                 remaining -= skipped
             } else {
-                if (input.read() == -1) return false
+                val b = try { input.read() } catch (e: Exception) { return false }
+                if (b == -1) return false
                 remaining--
             }
         }

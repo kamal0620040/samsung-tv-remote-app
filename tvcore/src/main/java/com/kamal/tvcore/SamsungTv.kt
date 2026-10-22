@@ -363,6 +363,12 @@ class SamsungTv(
      * A call that times out clears its pending request, so the next call
      * sends a fresh request instead of awaiting a dead one forever.
      * Cancellation of the caller is propagated, never swallowed.
+     *
+     * Transport failures (the request could not be sent, timed out, or the
+     * connection dropped) throw [IllegalStateException], so callers can
+     * tell "the TV has no apps" (an empty list) from "we could not ask".
+     * Every waiter on a shared request is completed one way or another:
+     * nobody is left awaiting a request that will never be answered.
      */
     suspend fun getApps(timeoutMs: Long = 6_000): List<TvApp> {
         appsCache?.let { return it }
@@ -386,8 +392,12 @@ class SamsungTv(
                     )
             )
         ) {
-            synchronized(appsLock) { if (pendingApps === deferred) pendingApps = null }
-            return emptyList()
+            // Fail every waiter, not just this caller, then unregister.
+            synchronized(appsLock) {
+                if (pendingApps === deferred) pendingApps = null
+                deferred.completeExceptionally(IllegalStateException("app list request failed to send"))
+            }
+            throw IllegalStateException("app list request failed to send")
         }
         return try {
             val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
@@ -401,7 +411,7 @@ class SamsungTv(
                         deferred.completeExceptionally(IllegalStateException("app list request timed out"))
                     }
                 }
-                emptyList()
+                throw IllegalStateException("app list request timed out")
             } else {
                 result
             }
@@ -409,6 +419,11 @@ class SamsungTv(
             // The caller itself was cancelled: drop the registration so the
             // next call starts fresh, but leave the deferred for others.
             synchronized(appsLock) { if (pendingApps === deferred) pendingApps = null }
+            throw e
+        } catch (e: IllegalStateException) {
+            // A transport failure (from the send/timeout paths above, or
+            // failPending on disconnect): surface it, never disguise it
+            // as an empty app list.
             throw e
         } catch (e: Exception) {
             emptyList()
@@ -438,6 +453,9 @@ class SamsungTv(
                         )
                 )
             ) {
+                // Fail the shared deferred before unregistering, so other
+                // callers awaiting this icon do not hang until their timeout.
+                mine.completeExceptionally(IllegalStateException("icon request failed to send"))
                 pendingIcons.remove(iconPath, mine)
                 return null
             }
