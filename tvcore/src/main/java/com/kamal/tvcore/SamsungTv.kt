@@ -105,6 +105,7 @@ class SamsungTv(
         parts += if (attemptUsedToken) "pairing token sent" else "no pairing token"
         parts += if (certs?.get(host) != null) "certificate saved" else "no certificate saved"
         lastError?.let { parts += "error: $it" }
+        lastFailureDetail?.let { parts += "detail: $it" }
         return parts.joinToString(" · ")
     }
 
@@ -125,6 +126,12 @@ class SamsungTv(
 
     /** True once the current connect() has already retried without a token. */
     @Volatile private var attemptRetriedFresh = false
+
+    /** True when the current attempt must not send the stored token (the one tokenless re-pair retry). */
+    @Volatile private var attemptSkipToken = false
+
+    /** Raw detail of the most recent failure (exception name + short message), diagnostics line only. */
+    @Volatile private var lastFailureDetail: String? = null
 
     /** True once the current attempt reached the channel-connected event. */
     @Volatile private var attemptConnected = false
@@ -204,6 +211,7 @@ class SamsungTv(
         }
         attemptPort = port
         attemptRetriedFresh = false
+        attemptSkipToken = false
         startAttempt()
     }
 
@@ -219,7 +227,8 @@ class SamsungTv(
         ws = null
         try {
             val nameB64 = Base64.encodeToString(remoteName.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-            val storedToken = tokens.get(host)?.takeIf { it.isNotEmpty() }
+            val storedToken = if (attemptSkipToken) null
+                else tokens.get(host)?.takeIf { it.isNotEmpty() }
             attemptUsedToken = storedToken != null
             val url = HttpUrl.Builder()
                 .scheme("wss")
@@ -254,6 +263,12 @@ class SamsungTv(
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (gen != generation) return // stale socket
                     val msg = t.message ?: ""
+                    // Diagnostics only (the small details line): keep the
+                    // raw cause, with any token value scrubbed out.
+                    lastFailureDetail = t.javaClass.simpleName +
+                        msg.takeIf { it.isNotBlank() }?.let {
+                            ": " + it.replace(Regex("token=[^&\\s]*"), "token=...").take(90)
+                        }.orEmpty()
                     val kind = when {
                         isCertFailure(t) -> "cert"
                         t is java.net.ConnectException ||
@@ -279,6 +294,7 @@ class SamsungTv(
                         // Closed before the channel came up. For an attempt
                         // that used the stored token this is the classic
                         // signature of the TV no longer accepting it.
+                        lastFailureDetail = "socket closed before the channel connected"
                         failAttempt("failed", IllegalStateException("connection closed"))
                     }
                 }
@@ -291,28 +307,27 @@ class SamsungTv(
 
     /**
      * A connection attempt died before the channel came up. When the
-     * attempt used the stored pairing token and the failure is not a
-     * certificate problem, the likeliest cause is the TV no longer
+     * attempt used the stored pairing token and the failure is a
+     * refusal ("failed"), the likeliest cause is the TV no longer
      * accepting that token (its pairing entry removed, or the token
-     * rolled). Nothing else ever clears a stored token, so retrying
-     * with it would fail every future attempt the same way and the app
-     * would look permanently dead (Kamal's report, 2026-10-23:
-     * disconnect, reconnect, nothing works). Drop the token and retry
-     * once without it: the TV then shows its pairing prompt and issues
-     * a fresh token on connect. Certificate failures never retry here:
-     * they belong to the trust flow, which needs the stored candidate
-     * and the ERROR state.
+     * rolled), so retry once WITHOUT sending it: the TV then shows its
+     * pairing prompt and issues a fresh token, which handleMessage
+     * stores over the old one. The stored token is deliberately NOT
+     * deleted here: an earlier version deleted it on any refusal, which
+     * could destroy a good pairing on a transient failure and strand
+     * the app tokenless (the state Kamal's diagnostics showed on
+     * 2026-10-23). Certificate failures never retry here: they belong
+     * to the trust flow, which needs the stored candidate and the
+     * ERROR state. A TV that never answered (unreachable/timeout) is
+     * not retried either; a different token cannot help there.
      */
     private fun failAttempt(kind: String, cause: Throwable) {
         val host = ip
-        // Only a "failed" refusal earns the tokenless retry: if the TV
-        // never answered (unreachable/timeout) a different token cannot
-        // help, and a certificate failure belongs to the trust flow.
         if (!attemptConnected && kind == "failed" && attemptUsedToken &&
             !attemptRetriedFresh && host != null
         ) {
             attemptRetriedFresh = true
-            tokens.remove(host)
+            attemptSkipToken = true
             failPending(cause)
             startAttempt()
             return
@@ -348,6 +363,8 @@ class SamsungTv(
         when (msg.optString("event")) {
             "ms.channel.connect", "ms.channel.ready" -> {
                 attemptConnected = true
+                attemptSkipToken = false
+                lastFailureDetail = null
                 val token = msg.optJSONObject("data")?.optString("token").orEmpty()
                 val myIp = ip
                 if (token.isNotEmpty() && myIp != null) tokens.put(myIp, token)
@@ -364,7 +381,8 @@ class SamsungTv(
                 // The TV rejected the pairing token outright. It may keep
                 // the socket open afterwards, so do not wait for a close
                 // that might never come: run the same recovery as a
-                // pre-connect failure (drop the token, retry tokenless).
+                // pre-connect failure (retry once without the token).
+                lastFailureDetail = "ms.channel.unauthorized"
                 failAttempt("failed", IllegalStateException("unauthorized"))
             }
             "ed.installedApp.get" -> {
