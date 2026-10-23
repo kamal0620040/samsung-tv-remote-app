@@ -94,6 +94,18 @@ class SamsungTv(
     /** Incremented on every connect/disconnect; callbacks from older sockets are ignored. */
     @Volatile private var generation = 0
 
+    /** Port of the current connect() call, kept so a tokenless retry targets the same endpoint. */
+    private var attemptPort = 8002
+
+    /** True when the current attempt sent the stored pairing token. */
+    @Volatile private var attemptUsedToken = false
+
+    /** True once the current connect() has already retried without a token. */
+    @Volatile private var attemptRetriedFresh = false
+
+    /** True once the current attempt reached the channel-connected event. */
+    @Volatile private var attemptConnected = false
+
     /** A certificate seen during a handshake, not yet promoted to a stored pin. */
     private data class CandidatePin(val gen: Int, val host: String, val fingerprint: String)
 
@@ -164,25 +176,40 @@ class SamsungTv(
             _state.value = ConnState.ERROR
             return
         }
+        attemptPort = port
+        attemptRetriedFresh = false
+        startAttempt()
+    }
+
+    private fun startAttempt() {
+        val host = ip ?: return
+        attemptConnected = false
+        lastError = null
         _state.value = ConnState.CONNECTING
         val gen = generation
+        // Close any socket left over from the attempt this one replaces
+        // (the tokenless retry below reuses the same generation).
+        try { ws?.close(1000, null) } catch (e: Exception) { /* already closed */ }
+        ws = null
         try {
             val nameB64 = Base64.encodeToString(remoteName.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+            val storedToken = tokens.get(host)?.takeIf { it.isNotEmpty() }
+            attemptUsedToken = storedToken != null
             val url = HttpUrl.Builder()
                 .scheme("wss")
-                .host(ip)
-                .port(port)
+                .host(host)
+                .port(attemptPort)
                 .addPathSegments("api/v2/channels/samsung.remote.control")
                 .addQueryParameter("name", nameB64)
                 .apply {
-                    tokens.get(ip)?.takeIf { it.isNotEmpty() }?.let { addQueryParameter("token", it) }
+                    storedToken?.let { addQueryParameter("token", it) }
                 }
                 .build()
             val req = Request.Builder().url(url).build()
             // A trust manager bound to this host and this attempt, so a late
             // handshake from an older socket can never verify against (or
             // record a candidate for) the wrong TV.
-            val trustManager = PinningTrustManager(ip, gen)
+            val trustManager = PinningTrustManager(host, gen)
             val ssl = SSLContext.getInstance("TLS").apply {
                 init(null, arrayOf(trustManager), SecureRandom())
             }
@@ -201,7 +228,7 @@ class SamsungTv(
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (gen != generation) return // stale socket
                     val msg = t.message ?: ""
-                    lastError = when {
+                    val kind = when {
                         isCertFailure(t) -> "cert"
                         t is java.net.ConnectException ||
                             msg.contains("failed to connect", ignoreCase = true) ||
@@ -211,24 +238,60 @@ class SamsungTv(
                             msg.contains("after 10000ms", ignoreCase = true) -> "timeout"
                         else -> "failed"
                     }
-                    if (lastError != "cert") candidatePin = null // keep the candidate for the trust flow
-                    _state.value = ConnState.ERROR
-                    failPending(t)
+                    failAttempt(kind, t)
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     if (gen != generation) return // stale socket
-                    if (_state.value != ConnState.ERROR) _state.value = ConnState.DISCONNECTED
-                    // Transport failure is not caller cancellation: pending
-                    // requests fail with a normal exception so awaiting UI
-                    // coroutines end with an error state, not a cancel.
-                    failPending(IllegalStateException("connection closed"))
+                    if (attemptConnected) {
+                        if (_state.value != ConnState.ERROR) _state.value = ConnState.DISCONNECTED
+                        // Transport failure is not caller cancellation: pending
+                        // requests fail with a normal exception so awaiting UI
+                        // coroutines end with an error state, not a cancel.
+                        failPending(IllegalStateException("connection closed"))
+                    } else {
+                        // Closed before the channel came up. For an attempt
+                        // that used the stored token this is the classic
+                        // signature of the TV no longer accepting it.
+                        failAttempt("failed", IllegalStateException("connection closed"))
+                    }
                 }
             })
         } catch (e: Exception) {
             lastError = "failed"
             _state.value = ConnState.ERROR
         }
+    }
+
+    /**
+     * A connection attempt died before the channel came up. When the
+     * attempt used the stored pairing token and the failure is not a
+     * certificate problem, the likeliest cause is the TV no longer
+     * accepting that token (its pairing entry removed, or the token
+     * rolled). Nothing else ever clears a stored token, so retrying
+     * with it would fail every future attempt the same way and the app
+     * would look permanently dead (Kamal's report, 2026-10-23:
+     * disconnect, reconnect, nothing works). Drop the token and retry
+     * once without it: the TV then shows its pairing prompt and issues
+     * a fresh token on connect. Certificate failures never retry here:
+     * they belong to the trust flow, which needs the stored candidate
+     * and the ERROR state.
+     */
+    private fun failAttempt(kind: String, cause: Throwable) {
+        val host = ip
+        if (!attemptConnected && kind != "cert" && attemptUsedToken &&
+            !attemptRetriedFresh && host != null
+        ) {
+            attemptRetriedFresh = true
+            tokens.remove(host)
+            failPending(cause)
+            startAttempt()
+            return
+        }
+        lastError = kind
+        if (kind != "cert") candidatePin = null // keep the candidate for the trust flow
+        _state.value = ConnState.ERROR
+        failPending(cause)
     }
 
     /** Only an actual certificate validation failure counts as "cert"; other TLS errors do not. */
@@ -255,6 +318,7 @@ class SamsungTv(
         val msg = try { JSONObject(text) } catch (e: Exception) { return }
         when (msg.optString("event")) {
             "ms.channel.connect", "ms.channel.ready" -> {
+                attemptConnected = true
                 val token = msg.optJSONObject("data")?.optString("token").orEmpty()
                 val myIp = ip
                 if (token.isNotEmpty() && myIp != null) tokens.put(myIp, token)
@@ -266,6 +330,13 @@ class SamsungTv(
                     }
                 }
                 _state.value = ConnState.CONNECTED
+            }
+            "ms.channel.unauthorized" -> {
+                // The TV rejected the pairing token outright. It may keep
+                // the socket open afterwards, so do not wait for a close
+                // that might never come: run the same recovery as a
+                // pre-connect failure (drop the token, retry tokenless).
+                failAttempt("failed", IllegalStateException("unauthorized"))
             }
             "ed.installedApp.get" -> {
                 val data = msg.optJSONObject("data")

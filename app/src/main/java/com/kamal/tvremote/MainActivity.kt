@@ -1507,7 +1507,25 @@ class MainActivity : Activity() {
             }
             val irRow = settingRow2(Strings.t("set_ir"), null, "ic_ir")
             irRow.tap { enterIr() }
-            addSection("section_connection", sectionCard(listOf(tvRow, change, wake, irRow)), true)
+            val connRows = mutableListOf(tvRow, change, wake, irRow)
+            if (!tv.connected && prefs.savedIp != null) {
+                // A failed connection used to strand the user here: the TV
+                // row only opens details and there was no retry on this
+                // screen at all, so the app just looked dead (Kamal's
+                // report, 2026-10-23). Offer the retry, or the certificate
+                // trust action when that is the failure, right here.
+                val actRow = settingRow2(
+                    if (tv.lastError == "cert") Strings.t("trust_new") else Strings.t("connect"),
+                    null, "ic_play")
+                actRow.tap {
+                    val ip = prefs.savedIp
+                    if (ip != null) {
+                        if (tv.lastError == "cert") certTrustDialog(ip) else connectTo(ip)
+                    }
+                }
+                connRows.add(1, actRow)
+            }
+            addSection("section_connection", sectionCard(connRows), true)
             first = false
         }
 
