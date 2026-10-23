@@ -242,16 +242,7 @@ class SamsungTv(
             val storedToken = if (attemptSkipToken) null
                 else tokens.get(host)?.takeIf { it.isNotEmpty() }
             attemptUsedToken = storedToken != null
-            val url = HttpUrl.Builder()
-                .scheme("wss")
-                .host(host)
-                .port(attemptPort)
-                .addPathSegments("api/v2/channels/samsung.remote.control")
-                .addQueryParameter("name", nameB64)
-                .apply {
-                    storedToken?.let { addQueryParameter("token", it) }
-                }
-                .build()
+            val url = buildChannelUrl(host, attemptPort, nameB64, storedToken)
             val req = Request.Builder().url(url).build()
             // A trust manager bound to this host and this attempt, so a late
             // handshake from an older socket can never verify against (or
@@ -629,5 +620,28 @@ class SamsungTv(
         const val APP_YOUTUBE = "111299001912"
         const val APP_NETFLIX = "11101200001"
         const val APP_BROWSER = "org.tizen.browser"
+
+        /**
+         * The remote-control channel URL. OkHttp expresses a wss
+         * connection as an https request (the websocket handshake runs
+         * over the TLS connection), and HttpUrl.Builder accepts only
+         * the literal schemes "http" and "https": scheme("wss") throws
+         * IllegalArgumentException("unexpected scheme: wss"). The v1.11
+         * review pass rebuilt the working string URL with the Builder
+         * and that one word killed every connection attempt in
+         * v1.11–v1.20 before any network traffic happened, while the
+         * generic "failed" classification sent the diagnosis chasing
+         * pairing credentials instead (found 2026-10-23 from a
+         * device diagnostics screenshot).
+         */
+        internal fun buildChannelUrl(host: String, port: Int, nameB64: String, token: String?): HttpUrl =
+            HttpUrl.Builder()
+                .scheme("https")
+                .host(host)
+                .port(port)
+                .addPathSegments("api/v2/channels/samsung.remote.control")
+                .addQueryParameter("name", nameB64)
+                .apply { token?.let { addQueryParameter("token", it) } }
+                .build()
     }
 }
