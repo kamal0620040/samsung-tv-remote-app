@@ -1451,7 +1451,7 @@ class MainActivity : Activity() {
 
     // ---------------- Settings tab: grouped section cards ----------------
 
-    private fun settingRow2(title: String, value: String?, iconName: String, danger: Boolean = false, chevron: Boolean = true): LinearLayout {
+    private fun settingRow2(title: String, value: String?, iconName: String, danger: Boolean = false, chevron: Boolean = true, subBelow: Boolean = false): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1462,9 +1462,26 @@ class MainActivity : Activity() {
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
-        row.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(12f) })
-        if (value != null) {
-            row.addView(label(value, 12f, DIM).apply { maxLines = 1 })
+        if (subBelow && value != null) {
+            // Title over subtitle in one weighted column. The side-value
+            // layout starved the TV row's title to a sliver ("[..") when
+            // the value was a long "ip - model" string, because the value
+            // label measured at full width before the title got the rest.
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(titleTv)
+            col.addView(label(value, 12.5f, DIM).apply {
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2f) })
+            row.addView(col, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(12f) })
+        } else {
+            row.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(12f) })
+            if (value != null) {
+                row.addView(label(value, 12f, DIM).apply {
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                })
+            }
         }
         if (chevron) {
             val iv = icon("ic_back", 20f, DIM)
@@ -1518,7 +1535,7 @@ class MainActivity : Activity() {
         } else {
             val tvTitle = prefs.savedName ?: Strings.t("set_tv")
             val tvSub = listOfNotNull(prefs.savedIp, prefs.savedModel).joinToString(" · ")
-            val tvRow = settingRow2(tvTitle, tvSub.ifEmpty { null }, "ic_tv")
+            val tvRow = settingRow2(tvTitle, tvSub.ifEmpty { null }, "ic_tv", subBelow = true)
             tvRow.tap { tvDetailsDialog() }
             val change = settingRow2(Strings.t("set_change_tv"), null, "ic_search")
             change.tap { showSearch() }
@@ -1596,22 +1613,25 @@ class MainActivity : Activity() {
         aboutRows.add(aboutRow)
         addSection("section_about", sectionCard(aboutRows), first)
 
-        if (mode == "wifi") {
-            val disc = label(Strings.t("set_disconnect"), 16f, DANGER, gravity = Gravity.CENTER).apply {
-                setPadding(dp(16f), dp(16f), dp(16f), dp(16f))
+        if (mode == "wifi" && prefs.savedIp != null) {
+            // Connection-ending actions live in their own card, styled
+            // like every other Settings row. They used to be two bare
+            // centred red text labels floating under the About card,
+            // which read as broken UI (Kamal's report, 2026-10-23).
+            val actionRows = mutableListOf<View>()
+            if (tv.connected) {
+                val disc = settingRow2(Strings.t("set_disconnect"), null, "ic_exit", chevron = false)
+                disc.tap {
+                    tv.disconnect()
+                    prefs.savedIp = null
+                    prefs.savedName = null
+                    prefs.savedModel = null
+                    prefs.savedMac = null
+                    showSearch()
+                }
+                actionRows.add(disc)
             }
-            disc.tap {
-                tv.disconnect()
-                prefs.savedIp = null
-                prefs.savedName = null
-                prefs.savedModel = null
-                prefs.savedMac = null
-                showSearch()
-            }
-            root.addView(disc, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24f) })
-            val forget = label(Strings.t("forget_tv"), 16f, DANGER, gravity = Gravity.CENTER).apply {
-                setPadding(dp(16f), dp(8f), dp(16f), dp(16f))
-            }
+            val forget = settingRow2(Strings.t("forget_tv"), null, "ic_close", danger = true, chevron = false)
             forget.tap {
                 android.app.AlertDialog.Builder(this)
                     .setTitle(Strings.t("forget_tv"))
@@ -1632,7 +1652,8 @@ class MainActivity : Activity() {
                     .setNegativeButton(Strings.t("cancel"), null)
                     .show()
             }
-            root.addView(forget, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8f) })
+            actionRows.add(forget)
+            root.addView(sectionCard(actionRows), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(24f) })
         }
         return root
     }
