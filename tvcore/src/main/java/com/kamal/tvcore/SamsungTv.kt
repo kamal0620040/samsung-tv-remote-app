@@ -93,6 +93,21 @@ class SamsungTv(
     var lastError: String? = null
         private set
 
+    /**
+     * One-line snapshot of the current connection setup and last failure,
+     * shown in the UI (banner and Settings) so a screenshot of the app is
+     * enough to diagnose a refused connection: target, whether a pairing
+     * token was sent, whether a certificate is saved, and the failure kind.
+     */
+    fun diagLine(): String {
+        val host = ip ?: return ""
+        val parts = mutableListOf("TV $host:$attemptPort")
+        parts += if (attemptUsedToken) "pairing token sent" else "no pairing token"
+        parts += if (certs?.get(host) != null) "certificate saved" else "no certificate saved"
+        lastError?.let { parts += "error: $it" }
+        return parts.joinToString(" · ")
+    }
+
     @Volatile private var ws: WebSocket? = null
     @Volatile private var appsCache: List<TvApp>? = null
     @Volatile private var pendingApps: CompletableDeferred<List<TvApp>>? = null
@@ -290,7 +305,10 @@ class SamsungTv(
      */
     private fun failAttempt(kind: String, cause: Throwable) {
         val host = ip
-        if (!attemptConnected && kind != "cert" && attemptUsedToken &&
+        // Only a "failed" refusal earns the tokenless retry: if the TV
+        // never answered (unreachable/timeout) a different token cannot
+        // help, and a certificate failure belongs to the trust flow.
+        if (!attemptConnected && kind == "failed" && attemptUsedToken &&
             !attemptRetriedFresh && host != null
         ) {
             attemptRetriedFresh = true

@@ -427,7 +427,20 @@ class MainActivity : Activity() {
             }
             else -> {
                 dot.background = oval(if (tv.state.value == ConnState.ERROR) DANGER else DIM)
-                txt.text = Strings.t("status_disconnected")
+                // On a failure the status line itself carries the reason,
+                // not just "Not connected": the banner that used to be the
+                // only place with the reason was easy to miss or crop out
+                // of a screenshot, so the failure looked causeless.
+                txt.text = if (tv.state.value == ConnState.ERROR) {
+                    when (tv.lastError) {
+                        "unreachable" -> Strings.t("err_unreachable")
+                        "timeout" -> Strings.t("err_timeout")
+                        "cert" -> Strings.t("err_cert")
+                        else -> Strings.t("err_failed")
+                    }
+                } else {
+                    Strings.t("status_disconnected")
+                }
             }
         }
     }
@@ -525,12 +538,15 @@ class MainActivity : Activity() {
             return
         }
         if (tv.state.value == ConnState.ERROR) {
-            bannerMsg?.text = when (tv.lastError) {
+            val reason = when (tv.lastError) {
                 "unreachable" -> Strings.t("err_unreachable")
                 "timeout" -> Strings.t("err_timeout")
                 "cert" -> Strings.t("err_cert")
                 else -> Strings.t("err_failed")
             }
+            // The details line makes any screenshot of the banner a full
+            // diagnosis: target, token, certificate, failure kind.
+            bannerMsg?.text = reason + "\n" + tv.diagLine()
             bannerRetry?.text = if (tv.lastError == "cert") Strings.t("trust_new") else Strings.t("retry")
             wrap.visibility = View.VISIBLE
         } else {
@@ -1511,7 +1527,7 @@ class MainActivity : Activity() {
             }
             val irRow = settingRow2(Strings.t("set_ir"), null, "ic_ir")
             irRow.tap { enterIr() }
-            val connRows = mutableListOf(tvRow, change, wake, irRow)
+            val connRows = mutableListOf<View>(tvRow, change, wake, irRow)
             if (!tv.connected && prefs.savedIp != null) {
                 // A failed connection used to strand the user here: the TV
                 // row only opens details and there was no retry on this
@@ -1528,6 +1544,12 @@ class MainActivity : Activity() {
                     }
                 }
                 connRows.add(1, actRow)
+                // Same details line as the banner, here where the Connect
+                // action lives: target, token, certificate, failure kind.
+                val diag = label(tv.diagLine(), 11.5f, DIM).apply {
+                    setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
+                }
+                connRows.add(2, diag)
             }
             addSection("section_connection", sectionCard(connRows), true)
             first = false
