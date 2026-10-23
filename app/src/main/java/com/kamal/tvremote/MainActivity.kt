@@ -392,8 +392,12 @@ class MainActivity : Activity() {
     private fun buildStatusRow(): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(24f), dp(8f), dp(24f), dp(0f))
+            // The status message (dot + text) sits centred on the screen,
+            // not against the left edge, and tight to the top: it used to
+            // hang a little low with the extra top padding (Kamal,
+            // 2026-10-23).
+            gravity = Gravity.CENTER
+            setPadding(dp(24f), dp(2f), dp(24f), dp(0f))
         }
         statusDot = View(this).apply { background = oval(DIM) }
         row.addView(statusDot, LinearLayout.LayoutParams(dp(8f), dp(8f)))

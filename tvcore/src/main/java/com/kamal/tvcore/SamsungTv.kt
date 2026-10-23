@@ -66,9 +66,17 @@ data class TvApp(
  * Each connection gets its own trust manager bound to that TV and that
  * connection attempt. A handshake only records a candidate fingerprint;
  * the pin is stored once the channel actually connects, so a transient or
- * wrong endpoint is never pinned silently. When a stored pin exists, a
- * different certificate fails the connection with lastError "cert" until
- * the user explicitly trusts the new one (see [trustPendingCertificate]).
+ * wrong endpoint is never pinned silently.
+ *
+ * A stored pin that no longer matches does NOT fail the connection.
+ * Samsung TVs roll their self-signed certificate (a reboot or power cut
+ * is enough), and hard-failing on the new certificate bricked every
+ * reconnect until a manual re-trust buried in the UI (Kamal's report,
+ * 2026-10-23: the app showed Not connected from the moment it opened).
+ * The changed certificate is accepted and re-pinned once the channel
+ * connects; the real authentication gate is the pairing itself, since a
+ * certificate change also drops the stored token's session and the TV
+ * asks on its own screen before issuing a new token.
  */
 class SamsungTv(
     private val remoteName: String = "Kamal Remote",
@@ -151,10 +159,13 @@ class SamsungTv(
             // A late handshake from an older attempt must not overwrite
             // the current attempt's candidate.
             if (gen == generation) candidatePin = CandidatePin(gen, host, fp)
-            val stored = store.get(host)
-            if (stored != null && stored != fp) {
-                throw CertificateException("TV certificate changed")
-            }
+            // A fingerprint that differs from the stored pin is NOT
+            // rejected here: Samsung TVs roll their certificate on
+            // reboot, so a mismatch is routine, not an attack signal.
+            // The new fingerprint is re-pinned on connect (handleMessage)
+            // and the pairing token remains the authentication: if the
+            // TV also dropped the pairing, the token self-heal in
+            // failAttempt re-pairs through the TV's own Allow prompt.
         }
 
         override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
