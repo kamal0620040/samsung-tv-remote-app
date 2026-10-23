@@ -104,6 +104,9 @@ class MainActivity : Activity() {
     /** "wifi" (Samsung protocol) or "ir" (IR blaster) — routes every key. */
     private var mode = "wifi"
     private var tab = "remote"
+
+    /** Connection state the current Settings page was built against. */
+    private var settingsState: ConnState? = null
     private var screen = "search" // search | main | apps | input | mirror
     private var returnTab = "touchpad"
     private var mirrorQuality = 1
@@ -337,6 +340,7 @@ class MainActivity : Activity() {
 
     private fun showMain(newTab: String) {
         tab = newTab
+        settingsState = if (newTab == "settings") tv.state.value else null
         screen = "main"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -425,6 +429,18 @@ class MainActivity : Activity() {
         }
 
     private fun refreshChrome() {
+        if (tab == "settings" && mode == "wifi" && settingsState != null &&
+            tv.state.value != settingsState
+        ) {
+            // The Settings page is rendered from the connection state
+            // (the Connect row, the diagnostics line and the Disconnect
+            // row all depend on it) but was never updated afterwards, so
+            // a successful reconnect left the previous failure's error
+            // block on screen next to a Connected status (Kamal's
+            // report, 2026-10-23). Rebuild the page on a state change.
+            showMain("settings")
+            return
+        }
         refreshBanner()
         val dot = statusDot ?: return
         val txt = statusText ?: return
