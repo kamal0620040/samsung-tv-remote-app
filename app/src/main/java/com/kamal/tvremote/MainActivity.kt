@@ -343,7 +343,16 @@ class MainActivity : Activity() {
             setBackgroundColor(BG)
         }
         root.addView(buildBanner())
-        root.addView(buildStatusRow())
+        if (newTab != "settings") {
+            root.addView(buildStatusRow())
+        } else {
+            // No status line on Settings: its Connection section already
+            // shows the TV and its state, and the line read as clutter at
+            // the top of that page (Kamal, 2026-10-23). Null the fields
+            // so refreshChrome skips the detached views.
+            statusDot = null
+            statusText = null
+        }
         val content = when (newTab) {
             "control" -> controlTab()
             "touchpad" -> touchpadTab()
