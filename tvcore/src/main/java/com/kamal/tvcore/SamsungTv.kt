@@ -96,18 +96,29 @@ class SamsungTv(
     /**
      * One-line snapshot of the current connection setup and last failure,
      * shown in the UI (banner and Settings) so a screenshot of the app is
-     * enough to diagnose a refused connection: target, whether a pairing
-     * token was sent, whether a certificate is saved, and the failure kind.
+     * enough to diagnose a refused connection. Reports what is actually
+     * STORED (an earlier wording reported the last attempt instead, so a
+     * tokenless retry made a saved token look deleted), what the last
+     * attempt sent, the failure kind, and the raw failure detail.
      */
-    fun diagLine(): String {
+    fun diagLine(appVersion: String = ""): String {
         val host = ip ?: return ""
         val parts = mutableListOf("TV $host:$attemptPort")
-        parts += if (attemptUsedToken) "pairing token sent" else "no pairing token"
+        if (appVersion.isNotEmpty()) parts += "app $appVersion"
+        parts += if (tokens.get(host)?.isNotEmpty() == true) "pairing token saved"
+            else "no pairing token saved"
+        parts += if (attemptUsedToken) "last try sent the token" else "last try tokenless"
         parts += if (certs?.get(host) != null) "certificate saved" else "no certificate saved"
         lastError?.let { parts += "error: $it" }
         lastFailureDetail?.let { parts += "detail: $it" }
         return parts.joinToString(" · ")
     }
+
+    /** Short raw description of a failure for the diagnostics line, token values scrubbed. */
+    private fun describeFailure(t: Throwable): String =
+        t.javaClass.simpleName + (t.message?.takeIf { it.isNotBlank() }?.let {
+            ": " + it.replace(Regex("token=[^&\\s]*"), "token=...").take(90)
+        } ?: "")
 
     @Volatile private var ws: WebSocket? = null
     @Volatile private var appsCache: List<TvApp>? = null
@@ -205,6 +216,7 @@ class SamsungTv(
         disconnect()
         this.ip = ip
         if (!isValidHostAddress(ip)) {
+            lastFailureDetail = "saved address is not a valid IP literal"
             lastError = "failed"
             _state.value = ConnState.ERROR
             return
@@ -263,12 +275,8 @@ class SamsungTv(
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (gen != generation) return // stale socket
                     val msg = t.message ?: ""
-                    // Diagnostics only (the small details line): keep the
-                    // raw cause, with any token value scrubbed out.
-                    lastFailureDetail = t.javaClass.simpleName +
-                        msg.takeIf { it.isNotBlank() }?.let {
-                            ": " + it.replace(Regex("token=[^&\\s]*"), "token=...").take(90)
-                        }.orEmpty()
+                    // Diagnostics only (the small details line).
+                    lastFailureDetail = describeFailure(t)
                     val kind = when {
                         isCertFailure(t) -> "cert"
                         t is java.net.ConnectException ||
@@ -300,6 +308,11 @@ class SamsungTv(
                 }
             })
         } catch (e: Exception) {
+            // A synchronous failure while setting the attempt up (TLS
+            // context, URL, socket creation): record it in the
+            // diagnostics too, or this exit is indistinguishable from
+            // a silent one in a screenshot.
+            lastFailureDetail = describeFailure(e)
             lastError = "failed"
             _state.value = ConnState.ERROR
         }

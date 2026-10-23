@@ -406,6 +406,15 @@ class MainActivity : Activity() {
         return row
     }
 
+    /** Installed version name (for the connection diagnostics line). */
+    private fun appVersion(): String =
+        try {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+
     private fun refreshChrome() {
         refreshBanner()
         val dot = statusDot ?: return
@@ -546,7 +555,7 @@ class MainActivity : Activity() {
             }
             // The details line makes any screenshot of the banner a full
             // diagnosis: target, token, certificate, failure kind.
-            bannerMsg?.text = reason + "\n" + tv.diagLine()
+            bannerMsg?.text = reason + "\n" + tv.diagLine(appVersion())
             bannerRetry?.text = if (tv.lastError == "cert") Strings.t("trust_new") else Strings.t("retry")
             wrap.visibility = View.VISIBLE
         } else {
@@ -1546,7 +1555,7 @@ class MainActivity : Activity() {
                 connRows.add(1, actRow)
                 // Same details line as the banner, here where the Connect
                 // action lives: target, token, certificate, failure kind.
-                val diag = label(tv.diagLine(), 11.5f, DIM).apply {
+                val diag = label(tv.diagLine(appVersion()), 11.5f, DIM).apply {
                     setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
                 }
                 connRows.add(2, diag)
