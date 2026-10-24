@@ -53,8 +53,6 @@ private val DIM = Color.rgb(139, 147, 161) // #8B93A1
 private val ACCENT = Color.rgb(59, 130, 246) // #3B82F6
 private val DANGER = Color.rgb(239, 68, 68) // #EF4444
 private val GREEN = Color.rgb(61, 214, 140)
-private val ERR_BG = Color.argb(36, 239, 68, 68) // soft danger tint, no outline
-private val ERR_TEXT = Color.rgb(242, 244, 247)
 private const val PORTFOLIO_URL = "https://neupanekamal.com.np"
 
 class Prefs(context: Context) {
@@ -111,16 +109,14 @@ class MainActivity : Activity() {
     private var returnTab = "touchpad"
     private var mirrorQuality = 1
 
-    private var bannerCard: View? = null
-    private var bannerMsg: TextView? = null
-    private var statusDot: View? = null
+    private var statusChip: FrameLayout? = null
+    private var statusIcon: ImageView? = null
     private var statusText: TextView? = null
     private var searchList: LinearLayout? = null
     private var searchTitle: TextView? = null
     private var searchProgress: ProgressBar? = null
     private var scanGen = 0
     private var scanJob: kotlinx.coroutines.Job? = null
-    private var bannerRetry: TextView? = null
     private val iconCache = java.util.Collections.synchronizedMap(HashMap<String, android.graphics.Bitmap>())
     private val iconGate = kotlinx.coroutines.sync.Semaphore(4)
     private val irHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -346,7 +342,6 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
         }
-        root.addView(buildBanner())
         if (newTab != "settings") {
             root.addView(buildStatusRow())
         } else {
@@ -354,7 +349,8 @@ class MainActivity : Activity() {
             // shows the TV and its state, and the line read as clutter at
             // the top of that page (Kamal, 2026-10-23). Null the fields
             // so refreshChrome skips the detached views.
-            statusDot = null
+            statusChip = null
+            statusIcon = null
             statusText = null
         }
         val content = when (newTab) {
@@ -405,18 +401,45 @@ class MainActivity : Activity() {
     private fun buildStatusRow(): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            // The status message (dot + text) sits centred on the screen,
-            // not against the left edge, and tight to the top: it used to
-            // hang a little low with the extra top padding (Kamal,
-            // 2026-10-23).
+            // The status is an icon chip plus a short state word, centred
+            // on the screen and tight to the top. It used to be a bare dot
+            // beside a sentence, which read as generated filler, and the
+            // failure sentence now lives in Settings > Debug instead.
             gravity = Gravity.CENTER
             setPadding(dp(24f), dp(2f), dp(24f), dp(0f))
         }
-        statusDot = View(this).apply { background = oval(DIM) }
-        row.addView(statusDot, LinearLayout.LayoutParams(dp(8f), dp(8f)))
+        val chip = chipIcon("ic_tv", DIM)
+        statusChip = chip
+        statusIcon = chip.getChildAt(0) as ImageView
+        row.addView(chip, LinearLayout.LayoutParams(dp(22f), dp(22f)))
         statusText = label("", 12f, DIM)
         row.addView(statusText, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) })
         return row
+    }
+
+    /**
+     * A small icon in a tinted circle: the designed replacement for the
+     * bare coloured dot that used to sit beside status text. The chip
+     * keeps the row's height (22dp), so no screen gains a scrollbar.
+     */
+    private fun chipIcon(iconName: String, color: Int): FrameLayout {
+        val box = FrameLayout(this).apply {
+            background = oval(Color.argb(38, Color.red(color), Color.green(color), Color.blue(color)))
+        }
+        val iv = icon(iconName, 13f, color)
+        iv.layoutParams = FrameLayout.LayoutParams(dp(13f), dp(13f), Gravity.CENTER)
+        box.addView(iv)
+        return box
+    }
+
+    /** Recolour a status chip and swap its icon without rebuilding the row. */
+    private fun setChip(iconName: String, color: Int) {
+        val chip = statusChip ?: return
+        chip.background = oval(Color.argb(38, Color.red(color), Color.green(color), Color.blue(color)))
+        val iv = statusIcon ?: return
+        val id = resources.getIdentifier(iconName, "drawable", packageName)
+        if (id != 0) iv.setImageResource(id)
+        iv.setColorFilter(color)
     }
 
     /** Installed version name (for the connection diagnostics line). */
@@ -433,111 +456,40 @@ class MainActivity : Activity() {
             tv.state.value != settingsState
         ) {
             // The Settings page is rendered from the connection state
-            // (the Connect row, the diagnostics line and the Disconnect
-            // row all depend on it) but was never updated afterwards, so
-            // a successful reconnect left the previous failure's error
-            // block on screen next to a Connected status (Kamal's
-            // report, 2026-10-23). Rebuild the page on a state change.
+            // (the Connect row and the Disconnect row depend on it) but
+            // was never updated afterwards, so a successful reconnect
+            // left the previous failure's rows on screen next to a
+            // Connected status (Kamal's report, 2026-10-23). Rebuild
+            // the page on a state change.
             showMain("settings")
             return
         }
-        refreshBanner()
-        val dot = statusDot ?: return
+        if (statusChip == null || statusText == null) return
         val txt = statusText ?: return
         if (mode == "ir") {
-            dot.background = oval(ACCENT)
+            setChip("ic_ir", ACCENT)
             txt.text = Strings.t("ir_mode")
             return
         }
         when (tv.state.value) {
             ConnState.CONNECTED -> {
-                dot.background = oval(GREEN)
+                setChip("ic_check", GREEN)
                 val name = prefs.savedName ?: prefs.savedIp ?: ""
                 txt.text = if (name.isNotEmpty()) "$name · ${Strings.t("connected_to")}" else Strings.t("connected_to")
             }
             ConnState.CONNECTING -> {
-                dot.background = oval(ACCENT)
+                setChip("ic_retry", ACCENT)
                 txt.text = Strings.t("connecting")
             }
             else -> {
-                dot.background = oval(if (tv.state.value == ConnState.ERROR) DANGER else DIM)
-                // On a failure the status line itself carries the reason,
-                // not just "Not connected": the banner that used to be the
-                // only place with the reason was easy to miss or crop out
-                // of a screenshot, so the failure looked causeless.
-                txt.text = if (tv.state.value == ConnState.ERROR) {
-                    when (tv.lastError) {
-                        "unreachable" -> Strings.t("err_unreachable")
-                        "timeout" -> Strings.t("err_timeout")
-                        "cert" -> Strings.t("err_cert")
-                        else -> Strings.t("err_failed")
-                    }
-                } else {
-                    Strings.t("status_disconnected")
-                }
+                // The front view carries only the short state word. The
+                // failure sentence and the diagnostics moved to
+                // Settings > Debug, so a failure no longer prints its
+                // reason across the main screen.
+                setChip("ic_tv", DIM)
+                txt.text = Strings.t("status_disconnected")
             }
         }
-    }
-
-    private fun buildBanner(): View {
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = rounded(ERR_BG, 16f, this@MainActivity)
-            setPadding(dp(16f), dp(12f), dp(16f), dp(12f))
-            visibility = View.GONE
-        }
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val dot = View(this).apply { background = oval(DANGER) }
-        row.addView(dot, LinearLayout.LayoutParams(dp(8f), dp(8f)))
-        row.addView(label(Strings.t("err_title"), 16f, ERR_TEXT, bold = true).apply {
-            layoutParams = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) }
-        })
-        card.addView(row)
-        bannerMsg = label("", 12f, DIM)
-        card.addView(bannerMsg, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4f) })
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val retry = label(Strings.t("retry"), 12f, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            background = rippleKey(ACCENT, 16f)
-            setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
-        }
-        bannerRetry = retry
-        retry.tap {
-            val ip = prefs.savedIp
-            if (ip != null) {
-                if (tv.lastError == "cert") {
-                    certTrustDialog(ip)
-                } else {
-                    tv.connect(ip)
-                }
-            }
-        }
-        actions.addView(retry)
-        val wake = label(Strings.t("wake_retry"), 12f, ON_BG, bold = true, gravity = Gravity.CENTER).apply {
-            setPadding(dp(12f), dp(10f), dp(8f), dp(10f))
-        }
-        wake.tap {
-            scope.launch {
-                prefs.savedMac?.let { WakeOnLan.wake(it) }
-                delay(2500)
-                prefs.savedIp?.let { tv.connect(it) }
-            }
-        }
-        actions.addView(wake, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) })
-        val change = label(Strings.t("set_change_tv"), 12f, ON_BG, bold = true, gravity = Gravity.CENTER).apply {
-            setPadding(dp(8f), dp(10f), dp(4f), dp(10f))
-        }
-        change.tap { showSearch() }
-        actions.addView(change, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4f) })
-        card.addView(actions, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(11f) })
-
-        val wrap = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16f), dp(12f), dp(16f), dp(4f))
-            visibility = View.GONE
-            addView(card)
-        }
-        bannerCard = wrap
-        return wrap
     }
 
     /**
@@ -565,27 +517,25 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun refreshBanner() {
-        val wrap = bannerCard ?: return
-        if (mode != "wifi" || screen != "main") {
-            wrap.visibility = View.GONE
-            return
-        }
-        if (tv.state.value == ConnState.ERROR) {
-            val reason = when (tv.lastError) {
-                "unreachable" -> Strings.t("err_unreachable")
-                "timeout" -> Strings.t("err_timeout")
-                "cert" -> Strings.t("err_cert")
-                else -> Strings.t("err_failed")
-            }
-            // The details line makes any screenshot of the banner a full
-            // diagnosis: target, token, certificate, failure kind.
-            bannerMsg?.text = reason + "\n" + tv.diagLine(appVersion())
-            bannerRetry?.text = if (tv.lastError == "cert") Strings.t("trust_new") else Strings.t("retry")
-            wrap.visibility = View.VISIBLE
+    /**
+     * The one place for connection insider info: state plus the
+     * diagnostics line (target, token state, certificate state, failure
+     * kind and detail, never a token value). The front view no longer
+     * prints any of this; it shows only the short state word.
+     */
+    private fun debugDialog() {
+        val diag = tv.diagLine(appVersion())
+        val stateLine = "State: " + tv.state.value.name.lowercase()
+        val message = if (diag.isEmpty()) {
+            stateLine + "\n" + Strings.t("debug_no_tv") + "\nApp " + appVersion()
         } else {
-            wrap.visibility = View.GONE
+            stateLine + "\n" + diag.replace(" · ", "\n")
         }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(Strings.t("set_debug"))
+            .setMessage(message)
+            .setPositiveButton(Strings.t("close"), null)
+            .show()
     }
 
     private fun buildNav(active: String): View {
@@ -1073,14 +1023,14 @@ class MainActivity : Activity() {
             root.addView(castRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12f) })
         }
 
-        // Wi-Fi note pinned near the bottom with a status dot.
+        // Wi-Fi note pinned near the bottom, with the same icon chip the
+        // status row uses instead of a bare dot.
         root.addView(View(this), LinearLayout.LayoutParams(-1, 0, 1f))
         val note = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        val dot = View(this).apply { background = oval(if (tv.connected) GREEN else DIM) }
-        note.addView(dot, LinearLayout.LayoutParams(dp(8f), dp(8f)))
+        note.addView(chipIcon("ic_globe", if (tv.connected) GREEN else DIM), LinearLayout.LayoutParams(dp(22f), dp(22f)))
         note.addView(label(Strings.t("same_wifi"), 12f, DIM).apply {
             layoutParams = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) }
         })
@@ -1595,12 +1545,9 @@ class MainActivity : Activity() {
                     }
                 }
                 connRows.add(1, actRow)
-                // Same details line as the banner, here where the Connect
-                // action lives: target, token, certificate, failure kind.
-                val diag = label(tv.diagLine(appVersion()), 11.5f, DIM).apply {
-                    setPadding(dp(16f), dp(10f), dp(16f), dp(10f))
-                }
-                connRows.add(2, diag)
+                // The diagnostics line used to sit here too; it now lives
+                // only in Settings > Debug, so this card stays an action
+                // card instead of an error dump.
             }
             addSection("section_connection", sectionCard(connRows), true)
             first = false
@@ -1624,6 +1571,9 @@ class MainActivity : Activity() {
         val helpRow = settingRow2(Strings.t("help"), null, "ic_guide")
         helpRow.tap { showHelp() }
         aboutRows.add(helpRow)
+        val debugRow = settingRow2(Strings.t("set_debug"), null, "ic_tools")
+        debugRow.tap { debugDialog() }
+        aboutRows.add(debugRow)
         val shareRow = settingRow2(Strings.t("set_share"), null, "ic_send")
         shareRow.tap {
             val intent = Intent(Intent.ACTION_SEND).apply {
