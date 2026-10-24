@@ -205,6 +205,23 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    private fun isLandscape(): Boolean =
+        resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // The manifest keeps this activity alive across rotation, so the
+        // current screen must be rebuilt to pick the orientation layout:
+        // without this, a portrait-built tab only re-measures into
+        // landscape, and the Remote D-pad collapses to the short height
+        // (the 2026-10-24 landscape report). Search rebuilds the same
+        // way; the other screens re-measure well enough on their own.
+        when (screen) {
+            "main" -> showMain(tab)
+            "search" -> showSearch()
+        }
+    }
+
     /** Returns true when the press was handled in-app. */
     private fun handleBack(): Boolean {
         when (screen) {
@@ -360,8 +377,11 @@ class MainActivity : Activity() {
             "settings" -> settingsTab()
             else -> remoteTab()
         }
-        if (newTab == "remote" || newTab == "touchpad" || newTab == "mirroring") {
+        if (newTab == "remote" || newTab == "touchpad" || (newTab == "mirroring" && !isLandscape())) {
             // These tabs size themselves from the available height — no scroll.
+            // Mirroring is the exception in landscape: its fixed card grid is
+            // taller than a landscape height, so it scrolls there instead
+            // of clipping its bottom note off screen.
             root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
         } else {
             val scroll = ScrollView(this).apply {
@@ -587,12 +607,38 @@ class MainActivity : Activity() {
     // ---------------- Remote tab (fit-to-screen, weighted zones) ----------------
 
     private fun remoteTab(): View {
+        if (isLandscape()) return remoteTabLandscape()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24f), dp(12f), dp(24f), dp(16f))
         }
 
-        // Top row: Power (danger) left; Guide + Source right — all equal 56dp circles.
+        root.addView(remoteTopRow(), LinearLayout.LayoutParams(-1, dp(56f)))
+        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
+
+        // D-pad zone: flexible height; the pad itself is sized from this zone.
+        val dpadZone = FrameLayout(this)
+        dpadZone.addView(buildDpad(), FrameLayout.LayoutParams(-1, -1))
+        root.addView(dpadZone, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
+
+        // Rocker zone: same flexible height as the D-pad zone. Tools grid sits
+        // in the center column between the rockers — no dead gap.
+        val rockerZone = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        rockerZone.addView(rocker("vol", "KEY_VOLUP", "KEY_VOLDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
+        rockerZone.addView(remoteToolsGrid(), LinearLayout.LayoutParams(0, -1, 1f).apply {
+            leftMargin = dp(16f); rightMargin = dp(16f)
+        })
+        rockerZone.addView(rocker("ch", "KEY_CHUP", "KEY_CHDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
+        root.addView(rockerZone, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
+
+        root.addView(remoteBottomRow(), LinearLayout.LayoutParams(-1, -2))
+        return root
+    }
+
+    /** Top row shared by both Remote orientations: Power left, Guide + Source right. */
+    private fun remoteTopRow(): LinearLayout {
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -607,19 +653,11 @@ class MainActivity : Activity() {
         val source = iconBtn("ic_source", ON_BG, 56f, 24f, desc = Strings.t("source"))
         source.tap { pressKey("KEY_SOURCE") }
         top.addView(source, LinearLayout.LayoutParams(dp(56f), dp(56f)).apply { leftMargin = dp(12f) })
-        root.addView(top, LinearLayout.LayoutParams(-1, dp(56f)))
-        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
+        return top
+    }
 
-        // D-pad zone: flexible height; the pad itself is sized from this zone.
-        val dpadZone = FrameLayout(this)
-        dpadZone.addView(buildDpad(), FrameLayout.LayoutParams(-1, -1))
-        root.addView(dpadZone, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
-
-        // Rocker zone: same flexible height as the D-pad zone. Tools grid sits
-        // in the center column between the rockers — no dead gap.
-        val rockerZone = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        rockerZone.addView(rocker("vol", "KEY_VOLUP", "KEY_VOLDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
+    /** Tools/Info/Back/Exit grid from the portrait rocker zone, with captions. */
+    private fun remoteToolsGrid(): LinearLayout {
         val center = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val toolRows = listOf(
             listOf(Triple("ic_tools", "tools", "KEY_TOOLS"), Triple("ic_info", "info", "KEY_INFO")),
@@ -635,14 +673,11 @@ class MainActivity : Activity() {
             }
             center.addView(row, LinearLayout.LayoutParams(-1, 0, 1f))
         }
-        rockerZone.addView(center, LinearLayout.LayoutParams(0, -1, 1f).apply {
-            leftMargin = dp(16f); rightMargin = dp(16f)
-        })
-        rockerZone.addView(rocker("ch", "KEY_CHUP", "KEY_CHDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
-        root.addView(rockerZone, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(View(this), LinearLayout.LayoutParams(-1, dp(16f)))
+        return center
+    }
 
-        // Bottom row: Home · Mute · Menu.
+    /** Bottom row shared by portrait: Home · Mute · Menu, with captions. */
+    private fun remoteBottomRow(): LinearLayout {
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         listOf(
             Triple("ic_home", "home", "KEY_HOME"),
@@ -651,7 +686,66 @@ class MainActivity : Activity() {
         ).forEach { (ic, lk, key) ->
             bottom.addView(labeledBtn(ic, Strings.t(lk), key = key), LinearLayout.LayoutParams(0, -2, 1f))
         }
-        root.addView(bottom, LinearLayout.LayoutParams(-1, -2))
+        return bottom
+    }
+
+    /**
+     * Landscape Remote: the portrait stack cannot work here, because the
+     * D-pad zone is half of an already short height, which shrank the pad
+     * to a dot (the 2026-10-24 report). Instead the pad gets the full
+     * content height on the left, and every other control stacks on the
+     * right: top row, rockers with an icon-only tools grid between them,
+     * and an icon-only Home/Mute/Menu row. No captions on the right side:
+     * at this height a labeled button would overflow its row.
+     */
+    private fun remoteTabLandscape(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(24f), dp(8f), dp(24f), dp(8f))
+        }
+        val dpadZone = FrameLayout(this)
+        dpadZone.addView(buildDpad(), FrameLayout.LayoutParams(-1, -1))
+        root.addView(dpadZone, LinearLayout.LayoutParams(0, -1, 1f))
+
+        val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        right.addView(remoteTopRow(), LinearLayout.LayoutParams(-1, dp(56f)))
+        right.addView(View(this), LinearLayout.LayoutParams(-1, dp(12f)))
+        val rockerRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        rockerRow.addView(rocker("vol", "KEY_VOLUP", "KEY_VOLDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        listOf(
+            listOf(Triple("ic_tools", "tools", "KEY_TOOLS"), Triple("ic_info", "info", "KEY_INFO")),
+            listOf(Triple("ic_back", "back", "KEY_RETURN"), Triple("ic_exit", "exit", "KEY_EXIT")),
+        ).forEach { pair ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            pair.forEach { (ic, lk, key) ->
+                val b = iconBtn(ic, ON_BG, 48f, 24f, desc = Strings.t(lk))
+                b.tap { pressKey(key) }
+                row.addView(centeredCell(b), LinearLayout.LayoutParams(0, -1, 1f))
+            }
+            tools.addView(row, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
+        rockerRow.addView(tools, LinearLayout.LayoutParams(0, -1, 1f).apply {
+            leftMargin = dp(12f); rightMargin = dp(12f)
+        })
+        rockerRow.addView(rocker("ch", "KEY_CHUP", "KEY_CHDOWN"), LinearLayout.LayoutParams(dp(76f), -1))
+        right.addView(rockerRow, LinearLayout.LayoutParams(-1, 0, 1f))
+        right.addView(View(this), LinearLayout.LayoutParams(-1, dp(12f)))
+        val bottomIcons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf(
+            Triple("ic_home", "home", "KEY_HOME"),
+            Triple("ic_mute", "mute", "KEY_MUTE"),
+            Triple("ic_menu", "menu", "KEY_MENU"),
+        ).forEach { (ic, lk, key) ->
+            val b = iconBtn(ic, ON_BG, 48f, 24f, desc = Strings.t(lk))
+            b.tap { pressKey(key) }
+            bottomIcons.addView(centeredCell(b), LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        right.addView(bottomIcons, LinearLayout.LayoutParams(-1, -2))
+        root.addView(right, LinearLayout.LayoutParams(0, -1, 1.2f).apply { leftMargin = dp(16f) })
         return root
     }
 
@@ -822,29 +916,57 @@ class MainActivity : Activity() {
     // ---------------- Touchpad tab ----------------
 
     private fun touchpadTab(): View {
+        if (isLandscape()) return touchpadTabLandscape()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24f), dp(12f), dp(24f), dp(16f))
         }
         // Top actions: three equal pills.
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun pill(iconName: String, descKey: String, action: () -> Unit): LinearLayout {
-            val p = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-                background = rippleKey(PANEL, 24f)
-                contentDescription = Strings.t(descKey)
-            }
-            p.addView(icon(iconName, 24f, ON_BG))
-            p.tap { action() }
-            return p
-        }
-        top.addView(pill("ic_keyboard", "tp_keyboard") { returnTab = "touchpad"; showInput() }, LinearLayout.LayoutParams(0, dp(48f), 1f))
-        top.addView(pill("ic_mic", "tp_voice") { startVoice() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
-        top.addView(pill("ic_apps", "apps") { returnTab = "touchpad"; showApps() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
+        top.addView(touchpadPill("ic_keyboard", "tp_keyboard") { returnTab = "touchpad"; showInput() }, LinearLayout.LayoutParams(0, dp(48f), 1f))
+        top.addView(touchpadPill("ic_mic", "tp_voice") { startVoice() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
+        top.addView(touchpadPill("ic_apps", "apps") { returnTab = "touchpad"; showApps() }, LinearLayout.LayoutParams(0, dp(48f), 1f).apply { leftMargin = dp(8f) })
         root.addView(top, LinearLayout.LayoutParams(-1, -2))
 
         // Swipe surface fills the remaining height.
+        val pad = touchpadPad()
+        root.addView(pad, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(16f) })
+
+        // Back · Home bars.
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bottom.addView(touchpadBar("ic_back", "back", "KEY_RETURN"), LinearLayout.LayoutParams(0, dp(52f), 1f))
+        bottom.addView(touchpadBar("ic_home", "home", "KEY_HOME"), LinearLayout.LayoutParams(0, dp(52f), 1f).apply { leftMargin = dp(12f) })
+        root.addView(bottom, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16f) })
+        return root
+    }
+
+    private fun touchpadPill(iconName: String, descKey: String, action: () -> Unit): LinearLayout {
+        val p = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = rippleKey(PANEL, 24f)
+            contentDescription = Strings.t(descKey)
+        }
+        p.addView(icon(iconName, 24f, ON_BG))
+        p.tap { action() }
+        return p
+    }
+
+    private fun touchpadBar(iconName: String, labelKey: String, key: String): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = rippleKey(PANEL, 16f)
+        }
+        row.addView(icon(iconName, 24f, ON_BG))
+        row.addView(label(Strings.t(labelKey), 12f, ON_BG, bold = true).apply {
+            layoutParams = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) }
+        })
+        row.tap { pressKey(key) }
+        return row
+    }
+
+    private fun touchpadPad(): FrameLayout {
         val pad = FrameLayout(this).apply {
             background = rounded(PANEL, 24f, this@MainActivity)
             contentDescription = Strings.t("swipe_hint")
@@ -860,26 +982,33 @@ class MainActivity : Activity() {
         centerCol.layoutParams = FrameLayout.LayoutParams(-2, -2, Gravity.CENTER)
         pad.addView(centerCol)
         attachSwipePad(pad)
-        root.addView(pad, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(16f) })
+        return pad
+    }
 
-        // Back · Home bars.
-        val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun bar(iconName: String, labelKey: String, key: String): LinearLayout {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-                background = rippleKey(PANEL, 16f)
-            }
-            row.addView(icon(iconName, 24f, ON_BG))
-            row.addView(label(Strings.t(labelKey), 12f, ON_BG, bold = true).apply {
-                layoutParams = LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8f) }
-            })
-            row.tap { pressKey(key) }
-            return row
+    /**
+     * Landscape Touchpad: the portrait stack squeezed the swipe surface to
+     * about 110dp tall. Here the pad takes the full content height on the
+     * left and the five actions stack in a side column, so swiping gets a
+     * tall surface instead of a wide strip.
+     */
+    private fun touchpadTabLandscape(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(24f), dp(8f), dp(24f), dp(12f))
         }
-        bottom.addView(bar("ic_back", "back", "KEY_RETURN"), LinearLayout.LayoutParams(0, dp(52f), 1f))
-        bottom.addView(bar("ic_home", "home", "KEY_HOME"), LinearLayout.LayoutParams(0, dp(52f), 1f).apply { leftMargin = dp(12f) })
-        root.addView(bottom, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16f) })
+        root.addView(touchpadPad(), LinearLayout.LayoutParams(0, -1, 1f))
+        val side = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun sideItem(v: View, first: Boolean = false) {
+            side.addView(v, LinearLayout.LayoutParams(-1, 0, 1f).apply {
+                if (!first) topMargin = dp(8f)
+            })
+        }
+        sideItem(touchpadPill("ic_keyboard", "tp_keyboard") { returnTab = "touchpad"; showInput() }, first = true)
+        sideItem(touchpadPill("ic_mic", "tp_voice") { startVoice() })
+        sideItem(touchpadPill("ic_apps", "apps") { returnTab = "touchpad"; showApps() })
+        sideItem(touchpadBar("ic_back", "back", "KEY_RETURN"))
+        sideItem(touchpadBar("ic_home", "home", "KEY_HOME"))
+        root.addView(side, LinearLayout.LayoutParams(dp(132f), -1).apply { leftMargin = dp(12f) })
         return root
     }
 
